@@ -76,17 +76,18 @@ software_key_determine_akcipher(const struct public_key *pkey,
 
 	if (strcmp(pkey->pkey_algo, "rsa") == 0) {
 		/*
-		 * RSA signatures usually use EMSA-PKCS1-1_5 [RFC3447 sec 8.2].
+		 * RSA signatures usually use EMSA-PKCS1-1_5 [RFC3447 sec 8.2] or EMSA-PSS [RFC8017 sec 9.1].
 		 */
-		if (strcmp(encoding, "pkcs1") == 0) {
+		if (strcmp(encoding, "pkcs1") == 0 || strcmp(encoding, "pss") == 0) {
 			if (!hash_algo)
 				n = snprintf(alg_name, CRYPTO_MAX_ALG_NAME,
-					     "pkcs1pad(%s)",
+					     "%spad(%s)",
+					     encoding,
 					     pkey->pkey_algo);
 			else
 				n = snprintf(alg_name, CRYPTO_MAX_ALG_NAME,
-					     "pkcs1pad(%s,%s)",
-					     pkey->pkey_algo, hash_algo);
+					     "%spad(%s,%s)",
+					     encoding, pkey->pkey_algo, hash_algo);
 			return n >= CRYPTO_MAX_ALG_NAME ? -EINVAL : 0;
 		}
 		if (strcmp(encoding, "raw") != 0)
@@ -422,6 +423,13 @@ int public_key_verify_signature(const struct public_key *pkey,
 		ret = cert_sig_digest_update(sig, tfm);
 		if (ret)
 			goto error_free_key;
+	}
+
+	if (strcmp(sig->encoding, "pss") == 0) {
+		ret = crypto_akcipher_set_sig_params(tfm, sig, sizeof(*sig));
+		if (ret) {
+			goto error_free_key;
+		}
 	}
 
 	sg_init_table(src_sg, 2);
