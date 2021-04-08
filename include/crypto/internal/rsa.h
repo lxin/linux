@@ -66,4 +66,7 @@ struct rsa_mpi_key {
 };
 
 extern struct crypto_template rsa_pkcs1pad_tmpl;
+#ifdef CONFIG_CRYPTO_RSASSA_PSS
+extern struct crypto_template rsa_psspad_tmpl;
+#endif /* CONFIG_CRYPTO_RSASSA_PSS */
 #endif
