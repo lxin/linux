@@ -1159,7 +1159,7 @@ static int nfs4_init_server(struct nfs_server *server, struct fs_context *fc)
 				ctx->nfs_server.nconnect,
 				ctx->nfs_server.max_connect,
 				fc->net_ns,
-				NFS_CS_XPRTSEC_NONE);
+				ctx->xprtsec_policy);
 	if (error < 0)
 		return error;
 

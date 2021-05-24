@@ -530,6 +530,14 @@ int nfs_create_rpc_client(struct nfs_client *clp,
 	if (test_bit(NFS_CS_REUSEPORT, &clp->cl_flags))
 		args.flags |= RPC_CLNT_CREATE_REUSEPORT;
 
+	switch (clp->cl_xprtsec) {
+	case NFS_CS_XPRTSEC_TLS:
+		args.xprtsec = RPC_XPRTSEC_TLS_X509;
+		break;
+	default:
+		args.xprtsec = RPC_XPRTSEC_NONE;
+	}
+
 	if (!IS_ERR(clp->cl_rpcclient))
 		return 0;
 
@@ -680,7 +688,7 @@ static int nfs_init_server(struct nfs_server *server,
 		.cred = server->cred,
 		.nconnect = ctx->nfs_server.nconnect,
 		.init_flags = (1UL << NFS_CS_REUSEPORT),
-		.xprtsec_policy = NFS_CS_XPRTSEC_NONE,
+		.xprtsec_policy = ctx->xprtsec_policy,
 	};
 	struct nfs_client *clp;
 	int error;
