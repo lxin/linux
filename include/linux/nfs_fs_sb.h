@@ -63,7 +63,10 @@ struct nfs_client {
 	u32			cl_minorversion;/* NFSv4 minorversion */
 	unsigned int		cl_nconnect;	/* Number of connections */
 	unsigned int		cl_max_connect; /* max number of xprts allowed */
-	const char *		cl_principal;  /* used for machine cred */
+	const char *		cl_principal;	/* used for machine cred */
+	unsigned int		cl_xprtsec;	/* xprt security policy */
+#define NFS_CS_XPRTSEC_NONE	(0)
+#define NFS_CS_XPRTSEC_TLS	(1)
 
 #if IS_ENABLED(CONFIG_NFS_V4)
 	struct list_head	cl_ds_clients; /* auth flavor data servers */
