@@ -1319,6 +1319,46 @@ TRACE_EVENT(xs_data_ready,
 	TP_printk("peer=[%s]:%s", __get_str(addr), __get_str(port))
 );
 
+/*
+ * From https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
+ *
+ * Captured March 2022. Other values are unassigned or reserved.
+ */
+#define rpc_show_tls_content_type(type) \
+	__print_symbolic(type, \
+		{ 20,		"change cipher spec" }, \
+		{ 21,		"alert" }, \
+		{ 22,		"handshake" }, \
+		{ 23,		"application data" }, \
+		{ 24,		"heartbeat" }, \
+		{ 25,		"tls12_cid" }, \
+		{ 26,		"ACK" })
+
+TRACE_EVENT(xs_tls_contenttype,
+	TP_PROTO(
+		const struct rpc_xprt *xprt,
+		unsigned char ctype
+	),
+
+	TP_ARGS(xprt, ctype),
+
+	TP_STRUCT__entry(
+		__string(addr, xprt->address_strings[RPC_DISPLAY_ADDR])
+		__string(port, xprt->address_strings[RPC_DISPLAY_PORT])
+		__field(unsigned long, ctype)
+	),
+
+	TP_fast_assign(
+		__assign_str(addr, xprt->address_strings[RPC_DISPLAY_ADDR]);
+		__assign_str(port, xprt->address_strings[RPC_DISPLAY_PORT]);
+		__entry->ctype = ctype;
+	),
+
+	TP_printk("peer=[%s]:%s: %s", __get_str(addr), __get_str(port),
+		rpc_show_tls_content_type(__entry->ctype)
+	)
+);
+
 TRACE_EVENT(xs_stream_read_data,
 	TP_PROTO(struct rpc_xprt *xprt, ssize_t err, size_t total),
 
