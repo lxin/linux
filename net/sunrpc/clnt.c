@@ -1162,7 +1162,8 @@ EXPORT_SYMBOL_GPL(rpc_run_task);
  * @msg: RPC call parameters
  * @flags: RPC call flags
  */
-int rpc_call_sync(struct rpc_clnt *clnt, const struct rpc_message *msg, int flags)
+int rpc_call_sync(struct rpc_clnt *clnt, const struct rpc_message *msg,
+		  unsigned int flags)
 {
 	struct rpc_task	*task;
 	struct rpc_task_setup task_setup_data = {
@@ -1197,9 +1198,9 @@ EXPORT_SYMBOL_GPL(rpc_call_sync);
  * @tk_ops: RPC call ops
  * @data: user call data
  */
-int
-rpc_call_async(struct rpc_clnt *clnt, const struct rpc_message *msg, int flags,
-	       const struct rpc_call_ops *tk_ops, void *data)
+int rpc_call_async(struct rpc_clnt *clnt, const struct rpc_message *msg,
+		   unsigned int flags, const struct rpc_call_ops *tk_ops,
+		   void *data)
 {
 	struct rpc_task	*task;
 	struct rpc_task_setup task_setup_data = {
@@ -3080,7 +3081,7 @@ static void rpc_show_task(const struct rpc_clnt *clnt,
 	if (RPC_IS_QUEUED(task))
 		rpc_waitq = rpc_qname(task->tk_waitqueue);
 
-	printk(KERN_INFO "%5u %04x %6d %8p %8p %8ld %8p %sv%u %s a:%ps q:%s\n",
+	printk(KERN_INFO "%5u %08x %6d %8p %8p %8ld %8p %sv%u %s a:%ps q:%s\n",
 		task->tk_pid, task->tk_flags, task->tk_status,
 		clnt, task->tk_rqstp, rpc_task_timeout(task), task->tk_ops,
 		clnt->cl_program->name, clnt->cl_vers, rpc_proc_name(task),

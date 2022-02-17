@@ -82,7 +82,7 @@ struct rpc_task {
 	ktime_t			tk_start;	/* RPC task init timestamp */
 
 	pid_t			tk_owner;	/* Process id for batching tasks */
-	unsigned short		tk_flags;	/* misc flags */
+	unsigned int		tk_flags;	/* misc flags */
 	unsigned short		tk_timeouts;	/* maj timeouts */
 
 #if IS_ENABLED(CONFIG_SUNRPC_DEBUG) || IS_ENABLED(CONFIG_TRACEPOINTS)
@@ -112,27 +112,27 @@ struct rpc_task_setup {
 	const struct rpc_call_ops *callback_ops;
 	void *callback_data;
 	struct workqueue_struct *workqueue;
-	unsigned short flags;
+	unsigned int flags;
 	signed char priority;
 };
 
 /*
  * RPC task flags
  */
-#define RPC_TASK_ASYNC		0x0001		/* is an async task */
-#define RPC_TASK_SWAPPER	0x0002		/* is swapping in/out */
-#define RPC_TASK_MOVEABLE	0x0004		/* nfs4.1+ rpc tasks */
-#define RPC_TASK_NULLCREDS	0x0010		/* Use AUTH_NULL credential */
-#define RPC_CALL_MAJORSEEN	0x0020		/* major timeout seen */
-#define RPC_TASK_DYNAMIC	0x0080		/* task was kmalloc'ed */
-#define	RPC_TASK_NO_ROUND_ROBIN	0x0100		/* send requests on "main" xprt */
-#define RPC_TASK_SOFT		0x0200		/* Use soft timeouts */
-#define RPC_TASK_SOFTCONN	0x0400		/* Fail if can't connect */
-#define RPC_TASK_SENT		0x0800		/* message was sent */
-#define RPC_TASK_TIMEOUT	0x1000		/* fail with ETIMEDOUT on timeout */
-#define RPC_TASK_NOCONNECT	0x2000		/* return ENOTCONN if not connected */
-#define RPC_TASK_NO_RETRANS_TIMEOUT	0x4000		/* wait forever for a reply */
-#define RPC_TASK_CRED_NOREF	0x8000		/* No refcount on the credential */
+#define RPC_TASK_ASYNC			0x00000001	/* is an async task */
+#define RPC_TASK_SWAPPER		0x00000002	/* is swapping in/out */
+#define RPC_TASK_MOVEABLE		0x00000004	/* nfs4.1+ rpc tasks */
+#define RPC_TASK_NULLCREDS		0x00000010	/* Use AUTH_NULL credential */
+#define RPC_CALL_MAJORSEEN		0x00000020	/* major timeout seen */
+#define RPC_TASK_DYNAMIC		0x00000080	/* task was kmalloc'ed */
+#define	RPC_TASK_NO_ROUND_ROBIN		0x00000100	/* send requests on "main" xprt */
+#define RPC_TASK_SOFT			0x00000200	/* Use soft timeouts */
+#define RPC_TASK_SOFTCONN		0x00000400	/* Fail if can't connect */
+#define RPC_TASK_SENT			0x00000800	/* message was sent */
+#define RPC_TASK_TIMEOUT		0x00001000	/* fail with ETIMEDOUT on timeout */
+#define RPC_TASK_NOCONNECT		0x00002000	/* return ENOTCONN if not connected */
+#define RPC_TASK_NO_RETRANS_TIMEOUT	0x00004000	/* wait forever for a reply */
+#define RPC_TASK_CRED_NOREF		0x00008000	/* No refcount on the credential */
 
 #define RPC_IS_ASYNC(t)		((t)->tk_flags & RPC_TASK_ASYNC)
 #define RPC_IS_SWAPPER(t)	((t)->tk_flags & RPC_TASK_SWAPPER)
