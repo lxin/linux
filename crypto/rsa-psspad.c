@@ -265,13 +265,119 @@ static int psspad_s_e_d(struct akcipher_request *req)
 	return -EOPNOTSUPP;
 }
 
+static int psspad_sign_complete(struct akcipher_request *req, int err)
+{
+	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
+	struct rsapad_tfm_ctx *ctx = akcipher_tfm_ctx(tfm);
+	u8 *out_buf;
+
+	out_buf = kzalloc(ctx->key_size, GFP_KERNEL);
+	if (!out_buf)
+		return -ENOMEM;
+
+	sg_copy_to_buffer(req->dst, sg_nents_for_len(req->dst, ctx->key_size),
+			  out_buf, ctx->key_size);
+
+	kfree(out_buf);
+	return err;
+}
+
+static void psspad_sign_complete_cb(struct crypto_async_request *child_async_req,
+				      int err)
+{
+	rsapad_akcipher_req_complete(child_async_req, err,
+				     psspad_sign_complete);
+}
+
+static int psspad_sign(struct akcipher_request *req)
+{
+	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
+	struct rsapad_tfm_ctx *ctx = akcipher_tfm_ctx(tfm);
+	struct rsa_mpi_key *pkey = akcipher_tfm_ctx(ctx->child);
+	struct rsapad_akciper_req_ctx *req_ctx = akcipher_request_ctx(req);
+	struct akcipher_instance *inst = akcipher_alg_instance(tfm);
+	struct rsapad_inst_ctx *ictx = akcipher_instance_ctx(inst);
+	u32 hlen = 32, slen = 32, emlen = ctx->key_size;
+	struct crypto_shash *hash_tfm = NULL;
+	struct shash_desc *desc = NULL;
+	u8 *h, *db, *dbmask, *mhash;
+	static u8 zeroes[8] = {0};
+	u8 salt[32], in_buf[32];
+	int err, pos, embits;
+
+	sg_copy_to_buffer(req->src, sg_nents_for_len(req->src, req->src_len),
+			  in_buf, req->src_len);
+
+	mhash = in_buf;
+	if (emlen < hlen + slen + 2)
+		return -EINVAL;
+
+        err = psspad_setup_shash(&hash_tfm, &desc, ictx->mgf_hash_algo);
+        if (err < 0)
+                return -EINVAL;
+
+        err = crypto_shash_init(desc);
+        if (!err)
+                err = crypto_shash_update(desc, zeroes, 8);
+        if (!err)
+                err = crypto_shash_update(desc, mhash, hlen);
+        if (!err)
+                err = crypto_shash_finup(desc, salt, slen, mhash);
+        if (err < 0)
+		return err;
+	h = mhash;
+
+	db = kzalloc(emlen - hlen - 1, GFP_ATOMIC);
+	if (!db)
+		return -ENOMEM;
+	*(db + (emlen - slen - hlen - 2)) = 0x01;
+	memcpy(db + (emlen - slen - hlen - 1), salt, slen);
+
+	dbmask = kzalloc(emlen - hlen - 1, GFP_ATOMIC);
+	if (!dbmask)
+		return -ENOMEM;
+
+        err = pkcs1_mgf1(h, hlen, desc, dbmask, emlen - hlen - 1);
+        if (err < 0)
+                return -EINVAL;
+
+        for (pos = 0; pos < (emlen - hlen - 1); pos++)
+                db[pos] ^= dbmask[pos];
+
+	embits = mpi_get_nbits(pkey->n) - 1;
+	db[0] &= ((u8) 0xff >> (8 * emlen - embits));
+
+	if (req->dst_len < ctx->key_size) {
+		req->dst_len = ctx->key_size;
+		return -EOVERFLOW;
+	}
+
+	req_ctx->in_buf = kmalloc(emlen, GFP_ATOMIC);
+	if (!req_ctx->in_buf)
+		return -ENOMEM;
+
+	memcpy(req_ctx->in_buf, db, emlen - 1 - hlen);
+	memcpy(req_ctx->in_buf + (emlen - 1 - hlen), h, hlen);
+	req_ctx->in_buf[emlen - 1] = 0xbc;
+
+	rsapad_akcipher_sg_set_buf(req_ctx->in_sg, req_ctx->in_buf, emlen, NULL);
+	rsapad_akcipher_setup_child(req, req_ctx->in_sg, req->dst, emlen, req->dst_len,
+				    psspad_sign_complete_cb);
+
+	err = crypto_akcipher_decrypt(&req_ctx->child_req);
+	if (err != -EINPROGRESS && err != -EBUSY)
+		return psspad_sign_complete(req, err);
+
+	return err;
+}
+
 static struct akcipher_alg psspad_alg = {
 	.init = rsapad_akcipher_init_tfm,
 	.exit = rsapad_akcipher_exit_tfm,
 
 	.encrypt = psspad_s_e_d,
 	.decrypt = psspad_s_e_d,
-	.sign = psspad_s_e_d,
+	.sign = psspad_sign,
 	.verify = psspad_verify,
 	.set_pub_key = rsapad_set_pub_key,
 	.set_priv_key = rsapad_set_priv_key,
