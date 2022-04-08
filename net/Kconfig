@@ -244,6 +244,7 @@ source "net/switchdev/Kconfig"
 source "net/l3mdev/Kconfig"
 source "net/qrtr/Kconfig"
 source "net/ncsi/Kconfig"
+source "net/quic/Kconfig"
 
 config PCPU_DEV_REFCNT
 	bool "Use percpu variables to maintain network device refcount"

@@ -37,6 +37,7 @@
 #include <net/netns/smc.h>
 #include <net/netns/bpf.h>
 #include <net/netns/mctp.h>
+#include <net/netns/quic.h>
 #include <net/net_trackers.h>
 #include <linux/ns_common.h>
 #include <linux/idr.h>
@@ -136,6 +137,9 @@ struct net {
 #endif
 #if defined(CONFIG_IP_SCTP) || defined(CONFIG_IP_SCTP_MODULE)
 	struct netns_sctp	sctp;
+#endif
+#if defined(CONFIG_IP_QUIC) || defined(CONFIG_IP_QUIC_MODULE)
+	struct netns_quic	quic;
 #endif
 #ifdef CONFIG_NETFILTER
 	struct netns_nf		nf;
