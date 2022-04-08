@@ -1,18 +1,83 @@
-Linux kernel
-============
+QUIC in Linux Kernel
+====================
 
-There are several guides for kernel developers and users. These guides can
-be rendered in a number of formats, like HTML and PDF. Please read
-Documentation/admin-guide/README.rst first.
+This branch implements QUIC(RFC9000) in kernel, and it provides
+basic handshakes and msg reliable sending and receiving.
 
-In order to build the documentation, use ``make htmldocs`` or
-``make pdfdocs``.  The formatted documentation can also be read online at:
+It is mostly to add files:
 
-    https://www.kernel.org/doc/html/latest/
+  - net/quic/*
+  - include/net/quic/quic.h
+  - include/uapi/linux/quic.h
+  - tools/testing/selftests/net/quic/
 
-There are various text files in the Documentation/ subdirectory,
-several of them using the Restructured Text markup notation.
+This patchset requires the feature described in:
 
-Please read the Documentation/process/changes.rst file, as it contains the
-requirements for building and running the kernel, and information about
-the problems which may result by upgrading your kernel.
+  https://lwn.net/Articles/853572/
+
+and a follow-up I added in this patchset.
+
+Currently, Crypto Algorithms supported are:
+
+  HKDF extract/expand: hmac(sha256)
+  Header Protection: ecb(aes)
+  ECDH key exchange: secp256r1(0x0017)
+  Certificate: rsa_pkcs1_sha256(0x0401)/rsa_pss_rsae_sha256(0x0804)
+  Signature Algorithm: rsa_pss_rsae_sha256(0x0804)
+  AEAD: TLS_AES_128_GCM_SHA256(0x1301)
+
+certificates can be set on server side only.
+
+How to Use It
+=============
+
+  After building and installing the kernel with:
+
+    CONFIG_IP_QUIC=m
+
+  then you can run the test simply by:
+
+    # cd tools/testing/selftests/net/quic/
+    # sh server.sh
+    # sh client.sh
+
+  and it can also interact with ngtcp2, after building ngtcp2:
+
+    # cd ngtcp2/examples/
+    # ./server 127.0.0.1 1234 ./pkey.pem ./cert.pem -s
+      (pkey.pem and cert.pem are
+          in tools/testing/selftests/net/quic/ss_cert/)
+    # cd tools/testing/selftests/net/quic/
+    # sh client.sh
+
+    # cd tools/testing/selftests/net/quic/
+    # sh server.sh
+    # cd ngtcp2/examples/
+    # ./client 127.0.0.1 1234 -s --groups="P-256"
+
+TODO
+====
+
+  - Protocol:
+    * Add ICMP(v6) TooBig/FragNeeded Prcess and PLPMTUD.
+    * Add more socket options and send/recv parameters.
+
+  - Handshake:
+    * Adjust code to support more crypto algorithms.
+    * Process more TLS 1.3 messages and extensions.
+    * Implement 0-RTT transmission.
+
+  - Connection:
+    * Support multiple connection ids.
+    * Add support for NEW/RETIRE_CONNECTION_ID Frames.
+    * Implement Connection Migration.
+
+  - Stream:
+    * Add state management for streams.
+    * Add support for RESET_STREAM/STOP_SENDING Frames
+
+  - Flow Control:
+    * Add support for MAX_STREAM_DATA/MAX_DATA
+
+  - Congestion Control:
+    * https://datatracker.ietf.org/doc/html/rfc9002
