@@ -17,13 +17,19 @@ int quic_do_rcv(struct sock *sk, struct sk_buff *skb)
 	struct quic_sock *qs = quic_sk(sk);
 	int err;
 
-	err = quic_packet_process(qs, skb);
-	if (err) {
-		kfree_skb(skb);
-		return err;
+	if (qs->state == QUIC_CS_CLOSING) {
+		err = -EPIPE;
+		goto err;
 	}
+	err = quic_packet_process(qs, skb);
+	if (err)
+		goto err;
 
 	return quic_write_queue_flush(qs);
+
+err:
+	kfree_skb(skb);
+	return err;
 }
 
 static void quic_cids_parse(struct sk_buff *skb)
@@ -58,7 +64,7 @@ int quic_rcv(struct sk_buff *skb)
 	cb->af->get_addr(&dest, skb, 0);
 	quic_cids_parse(skb);
 
-	qs = quic_ssk_lookup(skb, cb->dcid, cb->dcid_len);
+	qs = quic_ssk_lookup(skb, cb->dcid, &cb->dcid_len);
 	if (!qs) {
 		if (!hdr->form || hdr->type != QUIC_PKT_INITIAL)
 			goto err;
@@ -86,75 +92,54 @@ err:
 	return err;
 }
 
-int quic_pnmap_init(struct quic_sock *qs, gfp_t gfp)
+void quic_receive_list_del(struct quic_sock *qs, u32 sid)
 {
-	struct quic_pnmap *map = &qs->pnmap;
-	u16 len = BITS_PER_LONG;
+	struct sk_buff *n, *p = NULL;
+	struct quic_strm *strm;
+	u32 nid;
 
-	if (!map->pn_map) {
-		map->pn_map = kzalloc((len >> 3), gfp);
-		if (!map->pn_map)
-			return -ENOMEM;
-		map->len = len;
-	} else {
-		bitmap_zero(map->pn_map, map->len);
+	strm = quic_strm_rcv_get(qs, sid);
+	for (n = qs->packet.recv_list; n; n = n->next) {
+		nid = QUIC_RCV_CB(n)->strm_id;
+		if (sid > nid)
+			break;
+		if (sid < nid) {
+			p = n;
+			continue;
+		}
+		if (!p)
+			qs->packet.recv_list = n->next;
+		else
+			p->next = n->next;
+		strm->cnt--;
+	}
+}
+
+static int quic_receive_known_size_update(struct quic_sock *qs, struct sk_buff *skb)
+{
+	u32 sid = QUIC_RCV_CB(skb)->strm_id, strm_rwnd;
+	struct quic_packet *pkt = &qs->packet;
+	struct quic_strm *strm;
+	u64 known_size;
+
+	strm = quic_strm_rcv_get(qs, sid);
+	strm_rwnd = quic_strm_max_get(qs, sid);
+	known_size = strm->known_size;
+
+	if (QUIC_RCV_CB(skb)->strm_fin)
+		strm->known_size = QUIC_RCV_CB(skb)->strm_off + skb->len;
+	else if (strm->rcv_state < QUIC_STRM_P_SIZE_KNOWN)
+		strm->known_size = strm->rcv_off;
+
+	pkt->known_size += (strm->known_size - known_size);
+	if (pkt->known_size > pkt->rcv_max || strm->known_size > strm->rcv_max) {
+		pr_warn("recv msg err %llu %llu %llu %llu (%u)\n", pkt->known_size, pkt->rcv_max,
+			strm->known_size, strm->rcv_max, QUIC_RCV_CB(skb)->pn);
+		qs->frame.close.err = QUIC_ERROR_FLOW_CONTROL_ERROR;
+		return quic_frame_create(qs, QUIC_FRAME_CONNECTION_CLOSE);
 	}
 
-	map->base_pn = 1;
-	map->cum_pn_ack_point = map->base_pn - 1;
-	map->max_pn_seen = map->cum_pn_ack_point;
-
-	return 0;
-}
-
-void quic_pnmap_free(struct quic_sock *qs)
-{
-	struct quic_pnmap *map = &qs->pnmap;
-
-	map->len = 0;
-	kfree(map->pn_map);
-}
-
-static void quic_pnmap_update(struct quic_sock *qs)
-{
-	struct quic_pnmap *map = &qs->pnmap;
-	unsigned long zero_bit;
-	u16 len;
-
-	len = map->max_pn_seen - map->cum_pn_ack_point;
-	zero_bit = find_first_zero_bit(map->pn_map, len);
-	if (!zero_bit)
-		return;
-
-	map->base_pn += zero_bit;
-	map->cum_pn_ack_point += zero_bit;
-
-	bitmap_shift_right(map->pn_map, map->pn_map, zero_bit, map->len);
-}
-
-int quic_pnmap_mark(struct quic_sock *qs, u32 pn)
-{
-	struct quic_pnmap *map = &qs->pnmap;
-	u16 gap;
-
-	pn += 1;
-	if (pn < map->base_pn)
-		return 0;
-	gap = pn - map->base_pn;
-	if (gap >= map->len)
-		return -ENOMEM;
-
-	if (map->cum_pn_ack_point == map->max_pn_seen && gap == 0) {
-		map->max_pn_seen++;
-		map->cum_pn_ack_point++;
-		map->base_pn++;
-	} else {
-		if (map->max_pn_seen < pn)
-			map->max_pn_seen = pn;
-		set_bit(gap, map->pn_map);
-		quic_pnmap_update(qs);
-	}
-
+	skb_set_owner_r(skb, &qs->inet.sk);
 	return 0;
 }
 
@@ -162,51 +147,76 @@ int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb)
 {
 	u32 noff, off = QUIC_RCV_CB(skb)->strm_off;
 	u32 nid, id = QUIC_RCV_CB(skb)->strm_id;
+	struct sk_buff *n, *p = NULL, *tmp;
 	struct sock *sk = &qs->inet.sk;
-	struct quic_istrm *is;
-	struct sk_buff *n, *p;
+	struct quic_strm *strm;
 
-	is = quic_istrm_get(qs, id);
-	if (is->offset > off)
+	strm = quic_strm_rcv_get(qs, id);
+	strm = quic_strm_rcv_get(qs, id);
+	if (strm->rcv_off > off)
 		return -EINVAL;
 
-	if (is->offset < off) {
-		for (n = qs->packet.recv_list; n; n = n->next) {
+	if (off - strm->rcv_len > sk->sk_rcvbuf)
+		return -ENOBUFS;
+	if (QUIC_RCV_CB(skb)->strm_fin) {
+		if (strm->rcv_state == QUIC_STRM_P_RECV)
+			strm->rcv_state = QUIC_STRM_P_SIZE_KNOWN;
+		else if (strm->rcv_state >= QUIC_STRM_P_RECVD)
+			return -EINVAL;
+	}
+
+	if (strm->rcv_off < off) {
+		n = qs->packet.recv_list;
+		if (!n) {
+			qs->packet.recv_list = skb;
+			strm->cnt++;
+			goto out;
+		}
+		for (; n; n = n->next) {
 			noff = QUIC_RCV_CB(n)->strm_off;
 			nid = QUIC_RCV_CB(n)->strm_id;
-			if (id < nid) {
+			if (nid < id) {
 				p = n;
 				continue;
 			}
-			if (id == nid && off < noff) {
-				p = n;
-				continue;
+			if (id == nid) {
+				if (noff < off) {
+					p = n;
+					continue;
+				} else if (noff == off) {
+					pr_debug("dup offset\n");
+					return -EINVAL; /* dup */
+				}
 			}
 			if (!p) {
-				skb->next = n->next;
+				skb->next = n;
 				qs->packet.recv_list = skb;
 			} else {
-				skb->next = n->next;
+				skb->next = n;
 				p->next = skb;
 			}
-			is->cnt++;
-			break;
+			strm->cnt++;
+			goto out;
 		}
-		return 0;
+		p->next = skb;
+		strm->cnt++;
+		goto out;
 	}
 
 	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	sk->sk_data_ready(sk);
 	pr_debug("recv stream id: %u, off: %u, len: %u, fin: %u\n", id, off,
 		 skb->len, QUIC_RCV_CB(skb)->strm_fin);
 	if (QUIC_RCV_CB(skb)->strm_fin) {
-		is->offset = 0;
-		return 0;
+		strm->rcv_state = QUIC_STRM_P_RECVD;
+		goto out;
 	}
-	is->offset += skb->len;
-	if (!is->cnt)
-		return 0;
+	strm->rcv_off += skb->len;
+	if (!strm->cnt)
+		goto out;
 
 	n = qs->packet.recv_list;
+	p = NULL;
 	while (n) {
 		noff = QUIC_RCV_CB(n)->strm_off;
 		nid = QUIC_RCV_CB(n)->strm_id;
@@ -217,26 +227,78 @@ int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb)
 		}
 		if (id > nid)
 			break;
-		if (is->offset > noff)
+		if (strm->rcv_off > noff)
 			return -EINVAL;
-		if (is->offset < noff)
+		if (strm->rcv_off < noff)
 			break;
 		if (!p)
 			qs->packet.recv_list = n->next;
 		else
 			p->next = n->next;
-		is->cnt--;
-		skb = n;
-		n = n->next;
+		strm->cnt--;
 
-		__skb_queue_tail(&sk->sk_receive_queue, skb);
-		if (QUIC_RCV_CB(skb)->strm_fin) {
-			is->offset = 0;
-			return 0;
+		tmp = n->next;
+		__skb_queue_tail(&sk->sk_receive_queue, n);
+		sk->sk_data_ready(sk);
+		if (QUIC_RCV_CB(n)->strm_fin) {
+			strm->rcv_state = QUIC_STRM_P_RECVD;
+			break;
 		}
-		is->offset += skb->len;
-		if (!is->cnt)
-			return 0;
+		strm->rcv_off += n->len;
+		if (!strm->cnt)
+			break;
+		n = tmp;
 	}
+
+out:
+	return quic_receive_known_size_update(qs, skb);
+}
+
+void quic_receive_list_free(struct quic_sock *qs)
+{
+	struct sock *sk = &qs->inet.sk;
+	struct sk_buff *skb, *tmp;
+
+	skb = qs->packet.recv_list;
+	while (skb) {
+		pr_warn("recv list free %u\n", QUIC_RCV_CB(skb)->pn);
+		tmp = skb;
+		skb = skb->next;
+		kfree_skb(tmp);
+	}
+	qs->packet.recv_list = NULL;
+
+	skb = __skb_dequeue(&sk->sk_receive_queue);
+	while (skb) {
+		pr_warn("receive queue free %u\n", QUIC_RCV_CB(skb)->pn);
+		kfree_skb(skb);
+		skb = __skb_dequeue(&sk->sk_receive_queue);
+	}
+}
+
+int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[])
+{
+	struct sock *sk = &qs->inet.sk;
+	struct quic_evt_msg *em;
+	struct sk_buff *skb;
+
+	if (!(qs->packet.events & (1 << evt_type)))
+		return 0;
+
+	skb = alloc_skb(sizeof(*em), GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	QUIC_RCV_CB(skb)->is_evt = 1;
+	em = skb_put(skb, sizeof(*em));
+	em->evt_type = evt_type;
+	em->sub_type = sub_type;
+	em->value[0] = v[0];
+	em->value[1] = v[1];
+	em->value[2] = v[2];
+
+	pr_debug("event created %u %u\n", evt_type, sub_type);
+	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	sk->sk_data_ready(sk);
 	return 0;
 }

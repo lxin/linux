@@ -21,7 +21,7 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 	__u8 *p;
 
 	hlen = sizeof(struct udphdr) + qs->af->iphdr_len + MAX_HEADER;
-	len = sizeof(*hdr) + 4 + 2 + qs->dcid.len + qs->scid.len;
+	len = sizeof(*hdr) + 4 + 2 + qs->cids.dcid.cur->len + qs->cids.scid.cur->len;
 
 	if (type == QUIC_PKT_INITIAL) {
 		len += quic_put_varint_len(qs->token.len) + qs->token.len;
@@ -64,10 +64,10 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 	p = quic_put_pkt_num(p, QUIC_VERSION_V1, 4);
 
 	/* Various Length Header: dcid and scid */
-	p = quic_put_varint(p, qs->dcid.len);
-	p = quic_put_pkt_data(p, qs->dcid.id, qs->dcid.len);
-	p = quic_put_varint(p, qs->scid.len);
-	p = quic_put_pkt_data(p, qs->scid.id, qs->scid.len);
+	p = quic_put_varint(p, qs->cids.dcid.cur->len);
+	p = quic_put_pkt_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
+	p = quic_put_varint(p, qs->cids.scid.cur->len);
+	p = quic_put_pkt_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
 
 	/* Various Length Header: token */
 	if (type == QUIC_PKT_INITIAL) {
@@ -103,7 +103,7 @@ static struct sk_buff *quic_packet_short_create(struct quic_sock *qs)
 	__u8 *p;
 
 	hlen = sizeof(struct udphdr) + qs->af->iphdr_len + MAX_HEADER;
-	len = 1 + qs->dcid.len;
+	len = 1 + qs->cids.dcid.cur->len;
 
 	qs->packet.pn = qs->packet.ad_tx_pn++;
 	plen = quic_put_pkt_numlen(qs->packet.pn) - 1;
@@ -116,8 +116,6 @@ static struct sk_buff *quic_packet_short_create(struct quic_sock *qs)
 	rlen = dlen + QUIC_TAGLEN;
 	qs->packet.pn_off = len;
 	len += dlen;
-	pr_debug("remain len: %d, pn_offset: %d, pn_len: %d, len: %d\n",
-		 rlen, qs->packet.pn_off, qs->packet.pn_len, len);
 
 	skb = alloc_skb(len + QUIC_TAGLEN + hlen, GFP_ATOMIC);
 	if (!skb)
@@ -136,13 +134,14 @@ static struct sk_buff *quic_packet_short_create(struct quic_sock *qs)
 	p++;
 
 	/* Various Length Header: dcid */
-	p = quic_put_pkt_data(p, qs->dcid.id, qs->dcid.len);
+	p = quic_put_pkt_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
 
 	/* Various Length Header: packet number */
 	p = quic_put_pkt_num(p, qs->packet.pn, qs->packet.pn_len);
 	QUIC_SND_CB(skb)->pn = qs->packet.pn;
 	QUIC_SND_CB(skb)->type = QUIC_PKT_SHORT;
 	QUIC_SND_CB(skb)->has_strm = qs->frame.has_strm;
+	QUIC_SND_CB(skb)->strm_off = qs->frame.stream.off;
 
 	/* Frame */
 	p = quic_put_pkt_data(p, f->v, f->len);
@@ -165,8 +164,9 @@ static struct sk_buff *quic_packet_do_create(struct quic_sock *qs, u8 type)
 static int quic_packet_long_process(struct quic_sock *qs, struct sk_buff *skb, u8 **ptr)
 {
 	struct quic_lhdr *hdr = quic_lhdr(skb);
-	int len, pd_len, err;
+	u32 pd_len, pn_len, pn_off, pn, len;
 	u8 *p = *ptr;
+	int err;
 
 	p += 1 + 4 + 1 + QUIC_RCV_CB(skb)->scid_len +
 		1 + QUIC_RCV_CB(skb)->dcid_len;
@@ -181,8 +181,11 @@ static int quic_packet_long_process(struct quic_sock *qs, struct sk_buff *skb, u
 	err = quic_crypto_decrypt(qs, skb, hdr->type);
 	if (err)
 		goto out;
-	p = (u8 *)hdr + qs->packet.pn_off + qs->packet.pn_len;
-	err = quic_frame_process(qs, p, pd_len - QUIC_TAGLEN - qs->packet.pn_len);
+	pn_len = qs->packet.pn_len;
+	pn_off = qs->packet.pn_off;
+	pn = qs->packet.pn;
+	p = (u8 *)hdr + pn_off + pn_len;
+	err = quic_frame_process(qs, p, pd_len - QUIC_TAGLEN - pn_len);
 	if (err)
 		goto out;
 	if (qs->frame.need_ack) {
@@ -190,7 +193,7 @@ static int quic_packet_long_process(struct quic_sock *qs, struct sk_buff *skb, u
 		if (err)
 			goto out;
 	}
-	p += (pd_len - qs->packet.pn_len);
+	p += (pd_len - pn_len);
 out:
 	*ptr = p;
 	return err;
@@ -199,27 +202,42 @@ out:
 static int quic_packet_short_process(struct quic_sock *qs, struct sk_buff *skb, u8 **ptr)
 {
 	struct quic_shdr *hdr = quic_shdr(skb);
-	int err, pd_len;
+	u32 pd_len, pn_len, pn_off, pn;
+	union quic_addr src;
 	u8 *p = *ptr;
+	int err;
 
-	QUIC_RCV_CB(skb)->dcid_len = qs->scid.len;
-	p += 1 + qs->scid.len;
+	p += 1 + QUIC_RCV_CB(skb)->dcid_len;
 	qs->packet.pn_off = p - (u8 *)hdr;
 	pd_len = skb->len - qs->packet.pn_off;
 	qs->packet.pd_len = pd_len;
 	err = quic_crypto_decrypt(qs, skb, QUIC_PKT_SHORT);
+	if (err) {
+		pr_warn("pkt decrypt err %d\n", err);
+		goto out;
+	}
+	pn_len = qs->packet.pn_len;
+	pn_off = qs->packet.pn_off;
+	pn = qs->packet.pn;
+	p = (u8 *)hdr + pn_off + pn_len;
+	err = quic_frame_process(qs, p, pd_len - QUIC_TAGLEN - pn_len);
 	if (err)
 		goto out;
+	if (qs->frame.non_probe) {
+		qs->af->get_addr(&src, skb, 1);
+		if (memcmp(&src, quic_daddr_cur(qs), qs->af->addr_len)) {
+			err = quic_cid_path_change(qs, &src);
+			if (err)
+				goto out;
+		}
+	}
 	if (qs->frame.need_ack) {
+		qs->packet.pn = pn;
 		err = quic_frame_create(qs, QUIC_FRAME_ACK);
 		if (err)
 			goto out;
 	}
-	p = (u8 *)hdr + qs->packet.pn_off + qs->packet.pn_len;
-	err = quic_frame_process(qs, p, pd_len - QUIC_TAGLEN - qs->packet.pn_len);
-	if (!err)
-		quic_pnmap_mark(qs, qs->packet.pn);
-	p += (pd_len - qs->packet.pn_len);
+	p += (pd_len - pn_len);
 out:
 	*ptr = p;
 	return err;
@@ -245,15 +263,17 @@ int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb)
 			qs->packet.type = QUIC_PKT_SHORT;
 			err = quic_packet_short_process(qs, skb, &p);
 		}
-		if (err)
+		if (err) {
+			pr_warn("pkt process err %d %u\n", err, qs->packet.pn);
 			return err;
+		}
 
-		pr_debug("pkt process len %u %u\n", (u32)(p - skb->data), skb->len);
 		if ((u32)(p - skb->data) >= skb->len)
 			break;
 	}
 
 	consume_skb(skb);
+	quic_start_ping_timer(qs, 1);
 
 	for (i = 0; i < QUIC_FR_NR; i++) {
 		f = &qs->frame.f[i];

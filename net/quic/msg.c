@@ -204,6 +204,7 @@ static int quic_msg_client_hello_process(struct quic_sock *qs, u8 *p, u32 len)
 static int quic_msg_server_hello_process(struct quic_sock *qs, u8 *p, u32 len)
 {
 	struct sk_buff *skb = qs->packet.skb;
+	struct quic_cid *cid;
 	u8 *dcid;
 	int err;
 	u32 v;
@@ -233,13 +234,48 @@ static int quic_msg_server_hello_process(struct quic_sock *qs, u8 *p, u32 len)
 	if (!dcid)
 		return -ENOMEM;
 
-	kfree(qs->dcid.id);
-	qs->dcid.id = quic_mem_dup(dcid, len);
-	qs->dcid.len = len;
+	cid = qs->cids.dcid.list;
+	kfree(cid->id);
+	cid->id = quic_mem_dup(dcid, len);
+	cid->len = len;
 	qs->packet.cork = 1;
 	quic_stop_hs_timer(qs);
 	return 0;
 }
+
+static int quic_msg_unsupported_process(struct quic_sock *qs, u8 *p, u32 len)
+{
+	pr_err_once("crypto frame: unsupported msg %u\n", *(p - 4));
+	return -EPROTONOSUPPORT;
+}
+
+static struct quic_msg_ops quic_msgs[QUIC_MT_MAX + 1] = {
+	{quic_msg_unsupported_process}, /* 0 */
+	{quic_msg_client_hello_process},
+	{quic_msg_server_hello_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_newsession_ticket_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_encrypted_extension_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_certificate_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_certificate_verify_process},
+	{quic_msg_unsupported_process}, /* 16 */
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_finished_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+	{quic_msg_unsupported_process},
+};
 
 int quic_msg_process(struct quic_sock *qs, u8 *p, u32 hs_len, u32 hs_offset, u32 left)
 {
@@ -279,26 +315,14 @@ int quic_msg_process(struct quic_sock *qs, u8 *p, u32 hs_len, u32 hs_offset, u32
 		if (offset && type == qs->packet.type)
 			qs->frame.crypto.msg_off = 0;
 
-		if (v == QUIC_MT_CLIENT_HELLO) {
-			err = quic_msg_client_hello_process(qs, p, len);
-		} else if (v == QUIC_MT_SERVER_HELLO) {
-			err = quic_msg_server_hello_process(qs, p, len);
-		} else if (v == QUIC_MT_ENCRYPTED_EXTENSIONS) {
-			err = quic_msg_encrypted_extension_process(qs, p, len);
-		} else if (v == QUIC_MT_CERTIFICATE) {
-			err = quic_msg_certificate_process(qs, p, len);
-		} else if (v == QUIC_MT_CERTIFICATE_VERIFY) {
-			err = quic_msg_certificate_verify_process(qs, p, len);
-		} else if (v == QUIC_MT_FINISHED) {
-			err = quic_msg_finished_process(qs, p, len);
-		} else if (v == QUIC_MT_NEWSESSION_TICKET) {
-			err = quic_msg_newsession_ticket_process(qs, p, len);
-		} else {
+		if (v > QUIC_MT_MAX) {
 			pr_err_once("crypto frame: unsupported msg %u\n", v);
-			err = -EPROTONOSUPPORT;
+			return -EPROTONOSUPPORT;
 		}
+		quic_msgs[v].msg_process(qs, p, len);
 		if (err)
 			return err;
+
 		p += len;
 		left -= len;
 		if ((u32)(p - hs_v) >= hs_len + last)

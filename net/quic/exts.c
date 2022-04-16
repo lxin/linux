@@ -14,7 +14,7 @@
 
 static int quic_exts_transport_parameters_process(struct quic_sock *qs, u8 *p, u32 len)
 {
-	struct sock *sk = &qs->inet.sk;
+	struct quic_param *pm = &qs->params.peer;
 	u32 ext_len = len, v, type;
 	u8 *ext_p = p;
 
@@ -23,9 +23,21 @@ static int quic_exts_transport_parameters_process(struct quic_sock *qs, u8 *p, u
 		pr_debug("transport param type: %x\n", type);
 		len = quic_get_varint_next(&p, &v);
 		pr_debug("transport param len: %u\n", len);
-		if (type == 0x04) {
-			sk->sk_sndbuf = quic_get_varint(&len, p);
-			pr_debug("transport param v: %u\n", sk->sk_sndbuf);
+		if (type == QUIC_PARAM_max_udp_payload_size) {
+			pm->max_udp_payload_size = quic_get_varint(&len, p);
+		} else if (type == QUIC_PARAM_initial_max_data) {
+			pm->initial_max_data = quic_get_varint(&len, p);
+			qs->packet.snd_max = qs->params.peer.initial_max_data;
+		} else if (type == QUIC_PARAM_initial_max_stream_data_bidi_local) {
+			pm->initial_max_stream_data_bidi_local = quic_get_varint(&len, p);
+		} else if (type == QUIC_PARAM_initial_max_stream_data_bidi_remote) {
+			pm->initial_max_stream_data_bidi_remote = quic_get_varint(&len, p);
+		} else if (type == QUIC_PARAM_initial_max_stream_data_uni) {
+			pm->initial_max_stream_data_uni = quic_get_varint(&len, p);
+		} else if (type == QUIC_PARAM_initial_max_streams_bidi) {
+			pm->initial_max_streams_bidi = quic_get_varint(&len, p);
+		} else if (type == QUIC_PARAM_initial_max_streams_uni) {
+			pm->initial_max_streams_uni = quic_get_varint(&len, p);
 		}
 		p += len;
 		if ((u32)(p - ext_p) >= ext_len)
@@ -102,6 +114,12 @@ static int quic_exts_early_data_process(struct quic_sock *qs, u8 *p, u32 len)
 	return 0;
 }
 
+static int quic_exts_unsupported(struct quic_sock *qs, u8 *p, u32 len)
+{
+	pr_err_once("crypto frame: unsupported extension %u\n", *((u16 *)(p - 4)));
+	return -EPROTONOSUPPORT;
+}
+
 static int quic_exts_server_name(struct quic_sock *qs, u8 *p, u32 len)
 {
 	char name[20] = {'\0'};
@@ -164,6 +182,61 @@ static int quic_exts_transport_parameters_draft_process(struct quic_sock *qs, u8
 	return 0;
 }
 
+static struct quic_ext_ops quic_exts[QUIC_EXT_MAX + 1] = {
+	{quic_exts_server_name}, /* 0 */
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_supported_groups_process},
+	{quic_exts_ec_point_formats},
+	{quic_exts_unsupported},
+	{quic_exts_signature_algorithms},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_application_layer_protocol_negotiation}, /* 16 */
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_encrypt_then_mac},
+	{quic_exts_extended_master_secret},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported}, /* 32 */
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_session_ticket},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_early_data_process},
+	{quic_exts_supported_versions_process},
+	{quic_exts_unsupported},
+	{quic_exts_psk_kex_modes},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_unsupported}, /* 48 */
+	{quic_exts_unsupported},
+	{quic_exts_unsupported},
+	{quic_exts_key_share_process},
+};
+
 /* exported */
 int quic_exts_process(struct quic_sock *qs, u8 *p)
 {
@@ -179,40 +252,22 @@ int quic_exts_process(struct quic_sock *qs, u8 *p)
 		len = quic_get_fixint_next(&p, 2);
 		pr_debug("ext_sublen: %u\n", len);
 
-		if (v == QUIC_EXT_server_name) {
-			err = quic_exts_server_name(qs, p, len);
-		} else if (v == QUIC_EXT_supported_groups) {
-			err = quic_exts_supported_groups_process(qs, p, len);
-		} else if (v == QUIC_EXT_supported_versions) {
-			err = quic_exts_supported_versions_process(qs, p, len);
-		} else if (v == QUIC_EXT_ec_point_formats) {
-			err = quic_exts_ec_point_formats(qs, p, len);
-		} else if (v == QUIC_EXT_session_ticket) {
-			err = quic_exts_session_ticket(qs, p, len);
-		} else if (v == QUIC_EXT_application_layer_protocol_negotiation) {
-			err = quic_exts_application_layer_protocol_negotiation(qs, p, len);
-		} else if (v == QUIC_EXT_encrypt_then_mac) {
-			err = quic_exts_encrypt_then_mac(qs, p, len);
-		} else if (v == QUIC_EXT_extended_master_secret) {
-			err = quic_exts_extended_master_secret(qs, p, len);
-		} else if (v == QUIC_EXT_signature_algorithms) {
-			err = quic_exts_signature_algorithms(qs, p, len);
-		} else if (v == QUIC_EXT_psk_kex_modes) {
-			err = quic_exts_psk_kex_modes(qs, p, len);
-		} else if (v == QUIC_EXT_key_share) {
-			err = quic_exts_key_share_process(qs, p, len);
-		} else if (v == QUIC_EXT_quic_transport_parameters) {
-			err = quic_exts_transport_parameters_process(qs, p, len);
-		} else if (v == QUIC_EXT_quic_transport_parameters_draft) {
-			err = quic_exts_transport_parameters_draft_process(qs, p, len);
-		} else if (v == QUIC_EXT_early_data) {
-			err = quic_exts_early_data_process(qs, p, len);
-		} else {
-			pr_err_once("crypto frame: unsupported extension %u\n", v);
-			err = -EPROTONOSUPPORT;
+		if (v > QUIC_EXT_MAX) {
+			if (v == QUIC_EXT_quic_transport_parameters) {
+				err = quic_exts_transport_parameters_process(qs, p, len);
+			} else if (v == QUIC_EXT_quic_transport_parameters_draft) {
+				err = quic_exts_transport_parameters_draft_process(qs, p, len);
+			} else {
+				pr_err_once("crypto frame: unsupported extension %u\n", v);
+				err = -EPROTONOSUPPORT;
+			}
+			if (err)
+				return err;
 		}
+		err = quic_exts[v].ext_process(qs, p, len);
 		if (err)
 			return err;
+
 		p += len;
 		if ((u32)(p - exts_p) >= exts_len)
 			break;

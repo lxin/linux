@@ -17,7 +17,7 @@ static int quic_udp_rcv(struct sock *sk, struct sk_buff *skb)
 	if (skb_linearize(skb))
 		return 0;
 
-	QUIC_RCV_CB(skb)->src_port = udp_hdr(skb)->source;
+	QUIC_RCV_CB(skb)->udp_hdr = skb->transport_header;
 	skb_set_transport_header(skb, sizeof(struct udphdr));
 	quic_rcv(skb);
 	return 0;
@@ -28,12 +28,11 @@ static int quic_udp_err_lookup(struct sock *sk, struct sk_buff *skb)
 	return -ENOENT;
 }
 
-static struct quic_usock *quic_udp_sock_create(struct quic_sock *qs)
+static struct quic_usock *quic_udp_sock_create(struct quic_sock *qs, union quic_addr *a)
 {
 	struct udp_tunnel_sock_cfg tuncfg = {NULL};
 	struct net *net = sock_net(&qs->inet.sk);
 	struct udp_port_cfg udp_conf = {0};
-	union quic_addr *a = &qs->src;
 	struct quic_hash_head *head;
 	struct quic_usock *usk;
 	struct socket *sock;
@@ -66,12 +65,11 @@ static struct quic_usock *quic_udp_sock_create(struct quic_sock *qs)
 	return usk;
 }
 
-struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs)
+struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs, union quic_addr *a)
 {
 	struct net *net = sock_net(&qs->inet.sk);
 	struct quic_usock *usk, *us = NULL;
 	struct quic_hash_head *head;
-	union quic_addr *a = &qs->src;
 
 	head = quic_usk_head(net, a);
 	spin_lock(&head->lock);
@@ -84,7 +82,7 @@ struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs)
 	spin_unlock(&head->lock);
 
 	if (!us)
-		us = quic_udp_sock_create(qs);
+		us = quic_udp_sock_create(qs, a);
 
 	return us;
 }

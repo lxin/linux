@@ -2,7 +2,10 @@
 #ifndef __NETNS_QUIC_H__
 #define __NETNS_QUIC_H__
 
-struct quic_params {
+struct netns_quic {
+#ifdef CONFIG_SYSCTL
+	struct ctl_table_header *sysctl_header;
+#endif
 	u32 max_udp_payload_size;
 	u32 initial_max_data;
 	u32 initial_max_stream_data_bidi_local;
@@ -10,13 +13,6 @@ struct quic_params {
 	u32 initial_max_stream_data_uni;
 	u32 initial_max_streams_bidi;
 	u32 initial_max_streams_uni;
-};
-
-struct netns_quic {
-#ifdef CONFIG_SYSCTL
-	struct ctl_table_header *sysctl_header;
-#endif
-	struct quic_params p;
 };
 
 #endif /* __NETNS_QUIC_H__ */

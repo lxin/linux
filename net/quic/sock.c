@@ -12,6 +12,40 @@
 
 #include <net/quic/quic.h>
 
+struct quic_sock *quic_lsk_lookup(struct sk_buff *skb, union quic_addr *a)
+{
+	struct net *net = dev_net(skb->dev);
+	struct quic_sock *qs, *s = NULL;
+	struct quic_hash_head *head;
+
+	head = quic_lsk_head(net, a);
+	spin_lock(&head->lock);
+
+	hlist_for_each_entry(qs, &head->head, node) {
+		if (net == sock_net(&qs->inet.sk) &&
+		    QUIC_RCV_CB(skb)->af == qs->af &&
+		    !memcmp(a, quic_saddr_cur(qs), qs->af->addr_len)) {
+			if (likely(refcount_inc_not_zero(&qs->inet.sk.sk_refcnt)))
+				s = qs;
+			goto out;
+		}
+	}
+
+out:
+	spin_unlock(&head->lock);
+	return s;
+}
+
+struct quic_sock *quic_ssk_lookup(struct sk_buff *skb, u8 *scid, u8 *scid_len)
+{
+	struct quic_cid *cid = quic_cid_lookup(dev_net(skb->dev), scid, scid_len);
+
+	if (!cid || !refcount_inc_not_zero(&cid->qs->inet.sk.sk_refcnt))
+		return NULL;
+
+	return cid->qs;
+}
+
 static void quic_shakehand_timeout(struct timer_list *t)
 {
 	struct quic_sock *qs = from_timer(qs, t, hs_timer);
@@ -24,6 +58,7 @@ static void quic_shakehand_timeout(struct timer_list *t)
 		goto out;
 	}
 	sk->sk_err = -ETIMEDOUT;
+	pr_warn("hs timeout %d\n", sk->sk_err);
 	sk->sk_state_change(sk);
 out:
 	bh_unlock_sock(sk);
@@ -38,15 +73,70 @@ static void quic_retransmission_timeout(struct timer_list *t)
 
 	bh_lock_sock(sk);
 	if (sock_owned_by_user(sk)) {
-		if (!mod_timer(&qs->hs_timer, jiffies + (HZ / 20)))
+		if (!mod_timer(&qs->rtx_timer, jiffies + (HZ / 20)))
 			sock_hold(sk);
 		goto out;
 	}
 	err = quic_send_queue_rtx(qs);
 	if (err) {
+		pr_warn("rtx timeout %d\n", err);
 		sk->sk_err = err;
 		sk->sk_state_change(sk);
 	}
+out:
+	bh_unlock_sock(sk);
+	sock_put(sk);
+}
+
+static void quic_path_validation_timeout(struct timer_list *t)
+{
+	struct quic_sock *qs = from_timer(qs, t, path_timer);
+	struct sock *sk = &qs->inet.sk;
+
+	bh_lock_sock(sk);
+	if (sock_owned_by_user(sk)) {
+		if (!mod_timer(&qs->path_timer, jiffies + (HZ / 20)))
+			sock_hold(sk);
+		goto out;
+	}
+
+	pr_info("cur path is not reachable and move back to old one\n");
+
+	qs->path.dest.cur = !qs->path.dest.cur;
+	sk_dst_reset(&qs->inet.sk);
+out:
+	bh_unlock_sock(sk);
+	sock_put(sk);
+}
+
+static void quic_ping_timeout(struct timer_list *t)
+{
+	struct quic_sock *qs = from_timer(qs, t, ping_timer);
+	struct sock *sk = &qs->inet.sk;
+	struct sk_buff *skb;
+
+	bh_lock_sock(sk);
+	if (sock_owned_by_user(sk)) {
+		if (!mod_timer(&qs->ping_timer, jiffies + (HZ / 20)))
+			sock_hold(sk);
+		goto out;
+	}
+
+	if (qs->packet.ping_cnt++ > 3) {
+		sk->sk_err = -ETIMEDOUT;
+		pr_warn("ping timeout %d\n", sk->sk_err);
+		sk->sk_state_change(sk);
+		goto out;
+	}
+
+	quic_start_ping_timer(qs, 0);
+	qs->packet.f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_PING);
+	if (!skb)
+		goto out;
+	skb_set_owner_w(skb, sk);
+	qs->af->lower_xmit(qs, skb);
+
 out:
 	bh_unlock_sock(sk);
 	sock_put(sk);
@@ -90,8 +180,9 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 	ninet->mc_index = 0;
 	ninet->mc_list = NULL;
 
-	memcpy(&nqs->src, &qs->src, qs->af->addr_len);
-	nqs->usk = quic_us_get(qs->usk);
+	memcpy(quic_saddr_cur(nqs), quic_saddr_cur(qs), qs->af->addr_len);
+	nqs->path.src.usk[0] = quic_us_get(qs->path.src.usk[0]);
+	nqs->path.src.usk[1] = quic_us_get(qs->path.src.usk[1]);
 	nqs->crypt.crt.len = qs->crypt.crt.len;
 	nqs->crypt.crt.v = quic_mem_dup(qs->crypt.crt.v, nqs->crypt.crt.len);
 	if (!nqs->crypt.crt.v)
@@ -163,9 +254,7 @@ struct quic_sock *quic_lsk_process(struct quic_sock *qs, struct sk_buff *skb)
 void quic_start_rtx_timer(struct quic_sock *qs, u8 restart)
 {
 	if (restart || !timer_pending(&qs->rtx_timer)) {
-		unsigned long interval = msecs_to_jiffies(QUIC_RTX_INTERVAL);
-
-		if (!mod_timer(&qs->rtx_timer, jiffies + interval))
+		if (!mod_timer(&qs->rtx_timer, jiffies + qs->cong.rto))
 			sock_hold(&qs->inet.sk);
 	}
 }
@@ -192,15 +281,48 @@ void quic_stop_hs_timer(struct quic_sock *qs)
 		sock_put(&qs->inet.sk);
 }
 
+void quic_start_path_timer(struct quic_sock *qs, u8 restart)
+{
+	if (restart || !timer_pending(&qs->path_timer)) {
+		unsigned long interval = msecs_to_jiffies(QUIC_PATH_INTERVAL);
+
+		if (!mod_timer(&qs->path_timer, jiffies + interval))
+			sock_hold(&qs->inet.sk);
+	}
+}
+
+void quic_stop_path_timer(struct quic_sock *qs)
+{
+	if (!del_timer(&qs->path_timer))
+		sock_put(&qs->inet.sk);
+}
+
+void quic_start_ping_timer(struct quic_sock *qs, u8 restart)
+{
+	if (restart)
+		qs->packet.ping_cnt = 0;
+
+	if (restart || !timer_pending(&qs->ping_timer)) {
+		unsigned long interval = msecs_to_jiffies(QUIC_PING_INTERVAL);
+
+		if (!mod_timer(&qs->ping_timer, jiffies + interval))
+			sock_hold(&qs->inet.sk);
+	}
+}
+
+void quic_stop_ping_timer(struct quic_sock *qs)
+{
+	if (!del_timer(&qs->ping_timer))
+		sock_put(&qs->inet.sk);
+}
+
 int quic_sock_init(struct quic_sock *qs, union quic_addr *a, u8 *dcid, u8 dcid_len,
 		   u8 *scid, u8 scid_len)
 {
-	struct net *net = sock_net(&qs->inet.sk);
-	struct quic_hash_head *head;
 	int err;
 
 	INIT_LIST_HEAD(&qs->list);
-	err = quic_strm_init(qs, 3, 3);
+	err = quic_strm_init(qs, 2, 2);
 	if (err)
 		goto err;
 
@@ -216,30 +338,17 @@ int quic_sock_init(struct quic_sock *qs, union quic_addr *a, u8 *dcid, u8 dcid_l
 	if (err)
 		goto frame_err;
 
-	err = quic_pnmap_init(qs, GFP_KERNEL);
-	if (err)
-		goto pnmap_err;
-
-	head = quic_ssk_head(net, qs->scid.id);
-	spin_lock(&head->lock);
-	hlist_add_head(&qs->scid_node, &head->head);
-	spin_unlock(&head->lock);
-
 	qs->af->set_addr(&qs->inet.sk, a, false);
-	memcpy(&qs->dest, a, qs->af->addr_len);
-	head = quic_csk_head(net, &qs->src, &qs->dest);
-	spin_lock(&head->lock);
-	hlist_add_head(&qs->addr_node, &head->head);
-	spin_unlock(&head->lock);
+	memcpy(quic_daddr_cur(qs), a, qs->af->addr_len);
 
 	timer_setup(&qs->hs_timer, quic_shakehand_timeout, 0);
 	timer_setup(&qs->rtx_timer, quic_retransmission_timeout, 0);
+	timer_setup(&qs->path_timer, quic_path_validation_timeout, 0);
+	timer_setup(&qs->ping_timer, quic_ping_timeout, 0);
 
 	pr_info("quic sock init %p\n", qs);
 	return 0;
 
-pnmap_err:
-	quic_frame_free(qs);
 frame_err:
 	quic_crypt_free(qs);
 crypt_err:
@@ -253,8 +362,11 @@ err:
 
 void quic_sock_free(struct quic_sock *qs)
 {
-	struct net *net = sock_net(&qs->inet.sk);
-	struct quic_hash_head *head;
+	if (del_timer_sync(&qs->ping_timer))
+		sock_put(&qs->inet.sk);
+
+	if (del_timer_sync(&qs->path_timer))
+		sock_put(&qs->inet.sk);
 
 	if (del_timer_sync(&qs->rtx_timer))
 		sock_put(&qs->inet.sk);
@@ -262,17 +374,10 @@ void quic_sock_free(struct quic_sock *qs)
 	if (del_timer_sync(&qs->hs_timer))
 		sock_put(&qs->inet.sk);
 
-	head = quic_csk_head(net, &qs->src, &qs->dest);
-	spin_lock(&head->lock);
-	hlist_del(&qs->addr_node);
-	spin_unlock(&head->lock);
+	pr_info("quic sock free %p\n", qs);
+	quic_send_list_free(qs);
+	quic_receive_list_free(qs);
 
-	head = quic_ssk_head(net, qs->scid.id);
-	spin_lock(&head->lock);
-	hlist_del(&qs->scid_node);
-	spin_unlock(&head->lock);
-
-	quic_pnmap_free(qs);
 	quic_cid_free(qs);
 	quic_strm_free(qs);
 	quic_crypt_free(qs);

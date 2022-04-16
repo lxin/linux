@@ -643,11 +643,11 @@ static int quic_crypto_hd_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 
 	skcipher_request_set_crypt(req, &sg, &sg, QUIC_KEYLEN, NULL);
 	err = crypto_skcipher_encrypt(req);
 	if (err)
-		return err;
+		goto err;
 	pr_debug("decrypt hp mask: %16phN\n", mask);
 
 	p = (u8 *)hdr;
-	*p = (u8)(*p ^ (*p & (((*p & 0x80) == 0x80) ? 0x0f : 0x1f)));
+	*p = (u8)(*p ^ (mask[0] & (((*p & 0x80) == 0x80) ? 0x0f : 0x1f)));
 	qs->packet.pn_len = (*p & 0x03) + 1;
 	p += qs->packet.pn_off;
 	for (i = 0; i < qs->packet.pn_len; ++i)
@@ -655,6 +655,9 @@ static int quic_crypto_hd_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 
 
 	qs->packet.pn = quic_get_fixint_next(&p, qs->packet.pn_len);
 	pr_debug("decrypt hp pn: %u pn_len: %u\n", qs->packet.pn, qs->packet.pn_len);
+
+err:
+	skcipher_request_free(req);
 	return 0;
 }
 
@@ -908,11 +911,15 @@ int quic_crypto_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 		key = qs->crypt.l3_rx_key;
 		iv = qs->crypt.l3_rx_iv;
 		hp_key = qs->crypt.l3_rx_hp_key;
+	} else {
+		pr_warn("crypto unsupport type %d\n", type);
 	}
 
 	err = quic_crypto_hd_decrypt(qs, skb, hp_key);
-	if (err)
+	if (err) {
+		pr_warn("hd decrypt err %d\n", err);
 		return err;
+	}
 
 	return quic_crypto_pd_decrypt(qs, skb, key, iv);
 }
@@ -923,6 +930,7 @@ int quic_crypto_initial_keys_install(struct quic_sock *qs)
 	static u8 salt[] =
 	  "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a";
 	int salt_len = sizeof(salt) - 1;
+	struct quic_cid *cid;
 	u8 *dcid, dcid_len;
 	int err;
 
@@ -930,11 +938,13 @@ int quic_crypto_initial_keys_install(struct quic_sock *qs)
 	if (err)
 		return err;
 	if (qs->state < QUIC_CS_CLOSING) {
-		dcid = qs->dcid.id;
-		dcid_len = qs->dcid.len;
+		cid = qs->cids.dcid.list;
+		dcid = cid->id;
+		dcid_len = cid->len;
 	} else {
-		dcid = qs->scid.id;
-		dcid_len = qs->scid.len;
+		cid = qs->cids.scid.list;
+		dcid = cid->id;
+		dcid_len = cid->len;
 	}
 
 	err = quic_crypto_hkdf_extract(qs, salt, salt_len, dcid,

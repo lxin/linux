@@ -35,11 +35,11 @@ struct quic_globals {
 	struct quic_hash_head	*usk_hash;
 	struct quic_hash_head	*lsk_hash;
 	struct quic_hash_head	*csk_hash;
-	struct quic_hash_head	*ssk_hash;
+	struct quic_hash_head	*cid_hash;
 	int usk_size;
 	int lsk_size;
 	int csk_size;
-	int ssk_size;
+	int cid_size;
 };
 extern struct quic_globals quic_globals;
 extern long sysctl_quic_mem[3];
@@ -52,8 +52,8 @@ extern int sysctl_quic_wmem[3];
 #define quic_lsk_size		(quic_globals.lsk_size)
 #define quic_csk_hash		(quic_globals.csk_hash)
 #define quic_csk_size		(quic_globals.csk_size)
-#define quic_ssk_hash		(quic_globals.ssk_hash)
-#define quic_ssk_size		(quic_globals.ssk_size)
+#define quic_cid_hash		(quic_globals.cid_hash)
+#define quic_cid_size		(quic_globals.cid_size)
 
 enum {
 	QUIC_SS_CLOSED		= TCP_CLOSE,
@@ -80,6 +80,19 @@ union quic_addr {
 	struct sockaddr sa;
 };
 
+struct quic_path {
+	struct {
+		struct quic_usock *usk[2];
+		union quic_addr	addr[2];
+		u8 cur;
+	} src;
+	struct {
+		union quic_addr	addr[2];
+		u8 data[2][8];
+		u8 cur;
+	} dest;
+};
+
 struct quic_usock {
 	struct hlist_node node; /* usk hash table */
 	refcount_t refcnt;
@@ -87,23 +100,73 @@ struct quic_usock {
 	union quic_addr a;
 };
 
-struct quic_istrm {
-	__u32 id;
-	__u32 cnt;
-	__u32 offset;
+enum {
+	QUIC_STRM_L_READY,
+	QUIC_STRM_L_SEND,
+	QUIC_STRM_L_SENT,
+	QUIC_STRM_L_RECVD,
+	QUIC_STRM_L_RESET_SENT,
+	QUIC_STRM_L_RESET_RECVD,
+};
+
+enum {
+	QUIC_STRM_P_RECV = 0 << 4,
+	QUIC_STRM_P_SIZE_KNOWN = 1 << 4,
+	QUIC_STRM_P_RECVD = 2 << 4,
+	QUIC_STRM_P_READ = 3 << 4,
+	QUIC_STRM_P_RESET_RECVD = 4 << 4,
+	QUIC_STRM_P_RESET_READ = 5 << 4,
 };
 
 struct quic_strm {
-	GENRADIX(struct quic_istrm) bi;
-	GENRADIX(struct quic_istrm) uni;
-	__u16 bi_cnt;
-	__u16 uni_cnt;
+	__u32 id;
+	__u32 cnt;
+	__u64 rcv_off;
+	__u64 snd_off;
+	__u64 snd_len;
+	__u64 rcv_len;
+	__u8 rcv_state;
+	__u8 snd_state;
+	__u64 snd_max;
+	__u64 rcv_max;
+	__u64 known_size;
+	__u32 in_flight;
+};
+
+struct quic_strms {
+	GENRADIX(struct quic_strm) l_bi;
+	GENRADIX(struct quic_strm) l_uni;
+	GENRADIX(struct quic_strm) p_bi;
+	GENRADIX(struct quic_strm) p_uni;
+	__u32 l_bi_cnt;
+	__u32 l_uni_cnt;
+	__u32 p_bi_cnt;
+	__u32 p_uni_cnt;
 };
 
 struct quic_cid {
+	struct hlist_node node; /* scid hash key, cid hash table */
 	struct quic_cid *next;
+	struct quic_sock *qs;
 	__u8 *id;
 	__u8 len;
+	__u32 no;
+	struct rcu_head rcu;
+};
+
+struct quic_cids {
+	struct {
+		struct quic_cid	*list;
+		struct quic_cid	*cur;
+		u32 first;
+		u32 cnt;
+	} scid;
+	struct {
+		struct quic_cid	*list;
+		struct quic_cid	*cur;
+		u32 first;
+		u32 cnt;
+	} dcid;
 };
 
 struct quic_vlen {
@@ -212,8 +275,9 @@ struct quic_crypt {
 
 struct quic_frame {
 	struct quic_vlen f[QUIC_FR_NR];
-	u8 need_ack:1;
-	u8 has_strm:1;
+	u8 non_probe:1,
+	   need_ack:1,
+	   has_strm:1;
 	struct {
 		u8 type;
 		u32 off;
@@ -224,14 +288,29 @@ struct quic_frame {
 		struct iov_iter *msg;
 		u32 sid;
 		u32 mss;
+		u32 len;
 		u32 off;
 		u8  fin;
 	} stream;
+	struct {
+		u32 no;
+	} cid;
+	struct {
+		u8 *data;
+	} path;
+	struct {
+		u32 err;
+	} close;
+	struct {
+		u64 limit;
+	} max;
 };
 
 struct quic_packet {
 	struct sk_buff *recv_list;
 	struct sk_buff *skb;
+	struct sk_buff *fc_md;
+	struct sk_buff *fc_msd;
 	u32 in_tx_pn;
 	u32 hs_tx_pn;
 	u32 ad_tx_pn;
@@ -243,46 +322,80 @@ struct quic_packet {
 	u8 pn_off;
 	u8 type;
 	u8 cork;
+
+	u64 snd_len;
+	u64 rcv_len;
+	u64 snd_max;
+	u64 rcv_max;
+	u64 known_size;
+
+	u32 ping_cnt;
+
+	u32 events;
 };
 
-struct quic_pnmap {
-	unsigned long *pn_map;
-	u32 cum_pn_ack_point;
-	u32 max_pn_seen;
-	u32 base_pn;
-	u16 len;
+struct quic_cong {
+	u32 rto_pending:1;
+	u32 rto;
+	u32 rtt;
+	u32 srtt;
+	u32 rttvar;
+};
+
+struct quic_param {
+	u32 max_udp_payload_size;
+	u32 initial_max_data;
+	u32 initial_max_stream_data_bidi_local;
+	u32 initial_max_stream_data_bidi_remote;
+	u32 initial_max_stream_data_uni;
+	u32 initial_max_streams_bidi;
+	u32 initial_max_streams_uni;
+};
+
+struct quic_params {
+	struct quic_param local;
+	struct quic_param peer;
 };
 
 struct quic_sock {
 	struct inet_sock	inet;
 
-	struct hlist_node	addr_node; /* addr hash key, lsk or csk hash table */
-	struct hlist_node	scid_node; /* scid hash key, ssk hash table */
+	struct hlist_node	node; /* addr hash key, lsk or csk hash table */
 	struct list_head	list; /* listen sock head or accept sock list*/
 
 	struct quic_sock	*lsk; /* listening sock */
-	struct quic_usock	*usk; /* udp sock */
+	struct quic_af		*af;  /* inet4 or inet6 */
 
-	struct quic_af		*af;
-	union quic_addr		src;
-	union quic_addr		dest;
-
-	struct quic_cid		scid;
-	struct quic_cid		dcid;
+	struct quic_vlen	token;
 
 	struct quic_params	params;
-	struct quic_vlen	token;
 	enum quic_state		state;
 
 	struct quic_packet	packet;
 	struct quic_frame	frame;
 	struct quic_crypt	crypt;
-	struct quic_strm	strm;
-
-	struct quic_pnmap	pnmap;
+	struct quic_strms	strms;
+	struct quic_cids	cids;
+	struct quic_path	path;
+	struct quic_cong	cong;
 
 	struct timer_list	hs_timer;
 	struct timer_list	rtx_timer;
+	struct timer_list	path_timer;
+	struct timer_list	ping_timer;
+};
+
+struct quic_frame_ops {
+	int (*frame_create)(struct quic_sock *qs);
+	int (*frame_process)(struct quic_sock *qs, u8 **ptr, u8 type, u32 left);
+};
+
+struct quic_msg_ops {
+	int (*msg_process)(struct quic_sock *qs, u8 *p, u32 len);
+};
+
+struct quic_ext_ops {
+	int (*ext_process)(struct quic_sock *qs, u8 *p, u32 len);
 };
 
 struct quic_af {
@@ -336,7 +449,8 @@ enum {
 	QUIC_FRAME_CONNECTION_CLOSE = 0x1c,
 	QUIC_FRAME_CONNECTION_CLOSE_APP = 0x1d,
 	QUIC_FRAME_HANDSHAKE_DONE = 0x1e,
-	QUIC_FRAME_DATAGRAM = 0x30,
+	QUIC_FRAME_BASE_MAX = QUIC_FRAME_HANDSHAKE_DONE,
+	QUIC_FRAME_DATAGRAM = 0x30, /* RFC 9221 */
 	QUIC_FRAME_DATAGRAM_LEN = 0x31,
 };
 
@@ -357,6 +471,7 @@ enum {
 #define QUIC_MT_CERTIFICATE_STATUS              22
 #define QUIC_MT_SUPPLEMENTAL_DATA               23
 #define QUIC_MT_KEY_UPDATE                      24
+#define QUIC_MT_MAX	QUIC_MT_KEY_UPDATE
 
 #define QUIC_EXT_server_name                 0
 #define QUIC_EXT_max_fragment_length         1
@@ -389,8 +504,38 @@ enum {
 #define QUIC_EXT_post_handshake_auth         49
 #define QUIC_EXT_signature_algorithms_cert   50
 #define QUIC_EXT_key_share                   51
+#define QUIC_EXT_MAX	QUIC_EXT_key_share
 #define QUIC_EXT_quic_transport_parameters_draft	0xffa5
 #define QUIC_EXT_quic_transport_parameters		0x0039
+
+#define QUIC_PARAM_original_destination_connection_id	0x00
+#define QUIC_PARAM_max_udp_payload_size			0x03
+#define QUIC_PARAM_initial_max_data			0x04
+#define QUIC_PARAM_initial_max_stream_data_bidi_local	0x05
+#define QUIC_PARAM_initial_max_stream_data_bidi_remote	0x06
+#define QUIC_PARAM_initial_max_stream_data_uni		0x07
+#define QUIC_PARAM_initial_max_streams_bidi		0x08
+#define QUIC_PARAM_initial_max_streams_uni		0x09
+#define QUIC_PARAM_initial_source_connection_id		0x0f
+
+#define QUIC_ERROR_NO_ERROR			0x00
+#define QUIC_ERROR_INTERNAL_ERROR		0x01
+#define QUIC_ERROR_CONNECTION_REFUSED		0x02
+#define QUIC_ERROR_FLOW_CONTROL_ERROR		0x03
+#define QUIC_ERROR_STREAM_LIMIT_ERROR		0x04
+#define QUIC_ERROR_STREAM_STATE_ERROR		0x05
+#define QUIC_ERROR_FINAL_SIZE_ERROR		0x06
+#define QUIC_ERROR_FRAME_ENCODING_ERROR		0x07
+#define QUIC_ERROR_TRANSPORT_PARAMETER_ERROR	0x08
+#define QUIC_ERROR_CONNECTION_ID_LIMIT_ERROR	0x09
+#define QUIC_ERROR_PROTOCOL_VIOLATION		0x0a
+#define QUIC_ERROR_INVALID_TOKEN		0x0b
+#define QUIC_ERROR_APPLICATION_ERROR		0x0c
+#define QUIC_ERROR_CRYPTO_BUFFER_EXCEEDED	0x0d
+#define QUIC_ERROR_KEY_UPDATE_ERROR		0x0e
+#define QUIC_ERROR_AEAD_LIMIT_REACHED		0x0f
+#define QUIC_ERROR_NO_VIABLE_PATH		0x10
+#define QUIC_ERROR_CRYPTO_ERROR			0x0100
 
 #define QUIC_VERSION_V1 0x1
 
@@ -433,9 +578,9 @@ static inline u64 quic_get_varint(u32 *plen, const u8 *p)
 	return 0;
 }
 
-static inline u32 quic_get_varint_next(u8 **p, u32 *plen)
+static inline u64 quic_get_varint_next(u8 **p, u32 *plen)
 {
-	u32 v = quic_get_varint(plen, *p);
+	u64 v = quic_get_varint(plen, *p);
 
 	*p += *plen;
 	return v;
@@ -570,22 +715,44 @@ struct quic_rcv_cb {
 	u8 scid_len;
 	u32 strm_id;
 	u32 strm_off;
-	u8 strm_fin;
-	__be16 src_port;
+	u8 strm_fin:1,
+	   is_evt:1;
+	u32 udp_hdr;
+	u32 pn;
 };
 struct quic_snd_cb {
 	struct sk_buff *last;
-	u8 has_strm:1;
-	int count;
+	u32 sent_at;
+	u32 strm_id;
+	u32 strm_off;
+	u32 count;
+	u32 mlen;
+	u32 cnt;
 	u32 pn;
-	int cnt;
+	u8 has_strm:1,
+	   rtt_probe:1;
 	u8 type;
 };
 #define QUIC_RCV_CB(__skb)	((struct quic_rcv_cb *)&((__skb)->cb[0]))
 #define QUIC_SND_CB(__skb)	((struct quic_snd_cb *)&((__skb)->cb[0]))
 
 #define QUIC_HS_INTERVAL	5000
-#define QUIC_RTX_INTERVAL	2000
+#define QUIC_PATH_INTERVAL	3000
+#define QUIC_PING_INTERVAL	10000
+
+#define QUIC_RTO_INIT		3000
+#define QUIC_RTO_MIN		1000
+#define QUIC_RTO_MAX		60000
+#define QUIC_RTO_ALPHA		3
+#define QUIC_RTO_BETA		2
+
+#define QUIC_RTX_MAX		10
+
+#define QUIC_MAX_DATA		65535
+
+#define QUIC_STRM_SERV_MASK	0x1
+#define QUIC_STRM_UNI_MASK	0x2
+#define QUIC_STRM_MASK_BITS	2
 
 struct quic_lhdr {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
@@ -656,9 +823,9 @@ static inline struct quic_hash_head *quic_csk_head(struct net *net, union quic_a
 			       (quic_csk_size - 1)];
 }
 
-static inline struct quic_hash_head *quic_ssk_head(struct net *net, u8 *scid)
+static inline struct quic_hash_head *quic_cid_head(struct net *net, u8 *scid)
 {
-	return &quic_ssk_hash[jhash(scid, 4, 0) & (quic_ssk_size - 1)];
+	return &quic_cid_hash[jhash(scid, 4, 0) & (quic_cid_size - 1)];
 }
 
 static inline void quic_us_destroy(struct quic_usock *us)
@@ -675,13 +842,14 @@ static inline void quic_us_destroy(struct quic_usock *us)
 
 static inline struct quic_usock *quic_us_get(struct quic_usock *us)
 {
-	refcount_inc(&us->refcnt);
+	if (us)
+		refcount_inc(&us->refcnt);
 	return us;
 }
 
 static inline void quic_us_put(struct quic_usock *us)
 {
-	if (refcount_dec_and_test(&us->refcnt))
+	if (us && refcount_dec_and_test(&us->refcnt))
 		quic_us_destroy(us);
 }
 
@@ -712,49 +880,53 @@ static inline int quic_stream_wspace(struct sock *sk)
 	return sk_stream_wspace(sk);
 }
 
-static inline void quic_wmem_queued_add(struct sock *sk, int val)
+static inline bool quic_is_serv(struct quic_sock *qs)
 {
-	return sk_wmem_queued_add(sk, val);
+	return qs->state > QUIC_CS_CLOSING;
 }
 
-static inline void quic_wmem_free_skb(struct sock *sk, struct sk_buff *skb)
+static inline union quic_addr *quic_saddr_cur(struct quic_sock *qs)
 {
-	sk_wmem_queued_add(sk, -skb->truesize);
-	__kfree_skb(skb);
+	return &qs->path.src.addr[qs->path.src.cur];
 }
 
-static inline struct quic_istrm *quic_istrm_get(struct quic_sock *qs, u32 sid)
+static inline union quic_addr *quic_daddr_cur(struct quic_sock *qs)
 {
-	struct quic_strm *strm = &qs->strm;
-
-	if (sid & 0x2)
-		return genradix_ptr(&strm->uni, (sid >> 2));
-
-	return genradix_ptr(&strm->bi, (sid >> 2));
+	return &qs->path.dest.addr[qs->path.dest.cur];
 }
+
+#define quic_strm(strm, sid)	genradix_ptr(strm, sid)
 
 /* proto.c */
-struct quic_sock *quic_lsk_lookup(struct sk_buff *skb, union quic_addr *a);
-struct quic_sock *quic_ssk_lookup(struct sk_buff *skb, u8 *scid, u8 scid_len);
 struct quic_af *quic_af_get(sa_family_t family);
 int quic_dst_mss_check(struct quic_sock *qs, int hdr);
 
 /* udp.c */
-struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs);
+struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs, union quic_addr *a);
 
 /* strm.c */
 int quic_strm_init(struct quic_sock *qs, u32 uni_cnt, u32 bi_cnt);
 void quic_strm_free(struct quic_sock *qs);
+struct quic_strm *quic_strm_snd_get(struct quic_sock *qs, u32 sid);
+struct quic_strm *quic_strm_rcv_get(struct quic_sock *qs, u32 sid);
+struct quic_strm *quic_strm_get(struct quic_sock *qs, u32 sid);
+int quic_strm_max_get(struct quic_sock *qs, u32 sid);
 
 /* sock.c */
 int quic_sock_init(struct quic_sock *qs, union quic_addr *a,
 		   u8 *dcid, u8 dcid_len, u8 *scid, u8 scid_len);
-struct quic_sock *quic_lsk_process(struct quic_sock *qs, struct sk_buff *skb);
 void quic_sock_free(struct quic_sock *qs);
+struct quic_sock *quic_lsk_lookup(struct sk_buff *skb, union quic_addr *a);
+struct quic_sock *quic_ssk_lookup(struct sk_buff *skb, u8 *scid, u8 *scid_len);
+struct quic_sock *quic_lsk_process(struct quic_sock *qs, struct sk_buff *skb);
 void quic_start_rtx_timer(struct quic_sock *qs, u8 restart);
 void quic_stop_rtx_timer(struct quic_sock *qs);
 void quic_start_hs_timer(struct quic_sock *qs, u8 restart);
 void quic_stop_hs_timer(struct quic_sock *qs);
+void quic_start_path_timer(struct quic_sock *qs, u8 restart);
+void quic_stop_path_timer(struct quic_sock *qs);
+void quic_start_ping_timer(struct quic_sock *qs, u8 restart);
+void quic_stop_ping_timer(struct quic_sock *qs);
 
 /* packet.c */
 int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb);
@@ -786,10 +958,10 @@ int quic_crypto_server_finished_verify(struct quic_sock *qs);
 /* input.c */
 int quic_rcv(struct sk_buff *skb);
 int quic_do_rcv(struct sock *sk, struct sk_buff *skb);
-int quic_pnmap_init(struct quic_sock *qs, gfp_t gfp);
-void quic_pnmap_free(struct quic_sock *qs);
-int quic_pnmap_mark(struct quic_sock *qs, u32 pn);
 int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb);
+void quic_receive_list_del(struct quic_sock *qs, u32 sid);
+int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[]);
+void quic_receive_list_free(struct quic_sock *qs);
 
 /* output.c */
 int quic_v4_flow_route(struct quic_sock *qs);
@@ -801,10 +973,15 @@ void quic_write_queue_enqueue(struct quic_sock *qs, struct sk_buff *skb);
 void quic_send_queue_add(struct quic_sock *qs, struct sk_buff *skb);
 void quic_send_queue_check(struct quic_sock *qs, u32 v);
 int quic_send_queue_rtx(struct quic_sock *qs);
+void quic_send_list_free(struct quic_sock *qs);
 
 /* cid.c */
+int quic_cid_path_change(struct quic_sock *qs, union quic_addr *a);
+struct quic_cid *quic_cid_lookup(struct net *net, u8 *scid, u8 *scid_len);
+struct quic_cid *quic_cid_get(struct quic_cid *cids, u32 no);
 int quic_cid_init(struct quic_sock *qs, u8 *dcid, int dcid_len, u8 *scid, int scid_len);
 void quic_cid_free(struct quic_sock *qs);
+void quic_cid_destroy(struct quic_cid *cid);
 
 /* msg.c */
 int quic_msg_process(struct quic_sock *qs, u8 *p, u32 hs_offset, u32 hs_len, u32 left);
