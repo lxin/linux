@@ -76,6 +76,8 @@ struct sock_xprt {
 	void			(*old_state_change)(struct sock *);
 	void			(*old_write_space)(struct sock *);
 	void			(*old_error_report)(struct sock *);
+
+	struct rpc_clnt		*xprtsec_clnt;
 };
 
 /*
