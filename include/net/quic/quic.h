@@ -63,6 +63,7 @@ enum {
 };
 
 enum quic_state {
+	QUIC_CS_CLOSED,
 	QUIC_CS_CLIENT_INITIAL,
 	QUIC_CS_CLIENT_WAIT_HANDSHAKE,
 	QUIC_CS_CLIENT_TLS_HANDSHAKE_FAILED,
@@ -216,21 +217,48 @@ struct quic_initial_param {
 #define QUIC_H_CFIN	6
 #define QUIC_H_COUNT	7
 
+enum quic_pkt_type {
+	QUIC_PKT_VERSION_NEGOTIATION = 0xf0,
+	QUIC_PKT_INITIAL = 0x0,
+	QUIC_PKT_0RTT = 0x1,
+	QUIC_PKT_HANDSHAKE = 0x2,
+	QUIC_PKT_RETRY = 0x3,
+	QUIC_PKT_SHORT = 0x4
+};
+
+#define QUIC_FR_NR	(QUIC_PKT_SHORT + 1 + 1)
+
+struct quic_psk {
+	struct quic_psk *next;
+	u32 psk_sent_at;
+	u32 psk_expire;
+	struct quic_vlen pskid;
+	struct quic_vlen nonce;
+	struct quic_vlen mskey;
+};
+
 struct quic_crypt {
 	struct crypto_shash *sha_tfm;
+	u8 init_secret[QUIC_HKDF_HASHLEN];
 	u8 ch_secret[QUIC_HKDF_HASHLEN];
 	u8 sh_secret[QUIC_HKDF_HASHLEN];
 	u8 es_secret[QUIC_HKDF_HASHLEN];
 	u8 hs_secret[QUIC_HKDF_HASHLEN];
 	u8 ms_secret[QUIC_HKDF_HASHLEN];
+	u8 rms_secret[QUIC_HKDF_HASHLEN];
+	u8 fbk_secret[QUIC_HKDF_HASHLEN];
 	u8 dhe_secret[QUIC_HKDF_HASHLEN];
 	u8 capp_secret[QUIC_HKDF_HASHLEN];
 	u8 sapp_secret[QUIC_HKDF_HASHLEN];
+	u8 binder_secret[QUIC_HKDF_HASHLEN];
 
 	struct crypto_shash *hash_tfm;
 	u8 hash0[QUIC_HASHLEN];
+	u8 hash1[QUIC_HASHLEN];
 	u8 hash2[QUIC_HASHLEN];
 	u8 hash3[QUIC_HASHLEN];
+	u8 hash4[QUIC_HASHLEN];
+	u8 hash5[QUIC_HASHLEN];
 	u8 hash6[QUIC_HASHLEN];
 	u8 hash7[QUIC_HASHLEN];
 	u8 hash9[QUIC_HASHLEN];
@@ -244,6 +272,10 @@ struct quic_crypt {
 	u8 tx_iv[QUIC_IVLEN];
 	u8 rx_key[QUIC_KEYLEN];
 	u8 rx_iv[QUIC_IVLEN];
+	u8 l1_tx_key[QUIC_KEYLEN];
+	u8 l1_tx_iv[QUIC_IVLEN];
+	u8 l1_rx_key[QUIC_KEYLEN];
+	u8 l1_rx_iv[QUIC_IVLEN];
 	u8 l2_tx_key[QUIC_KEYLEN];
 	u8 l2_tx_iv[QUIC_IVLEN];
 	u8 l2_rx_key[QUIC_KEYLEN];
@@ -256,6 +288,8 @@ struct quic_crypt {
 	struct crypto_skcipher *skc_tfm;
 	u8 tx_hp_key[QUIC_KEYLEN];
 	u8 rx_hp_key[QUIC_KEYLEN];
+	u8 l1_tx_hp_key[QUIC_KEYLEN];
+	u8 l1_rx_hp_key[QUIC_KEYLEN];
 	u8 l2_tx_hp_key[QUIC_KEYLEN];
 	u8 l2_rx_hp_key[QUIC_KEYLEN];
 	u8 l3_tx_hp_key[QUIC_KEYLEN];
@@ -269,9 +303,9 @@ struct quic_crypt {
 	struct quic_vlen pkey;
 	struct quic_vlen sig;
 	struct quic_vlen crt;
-};
 
-#define QUIC_FR_NR	4
+	struct quic_psk *psks;
+};
 
 struct quic_frame {
 	struct quic_vlen f[QUIC_FR_NR];
@@ -311,6 +345,7 @@ struct quic_packet {
 	struct sk_buff *skb;
 	struct sk_buff *fc_md;
 	struct sk_buff *fc_msd;
+	struct sk_buff *ticket;
 	u32 in_tx_pn;
 	u32 hs_tx_pn;
 	u32 ad_tx_pn;
@@ -413,15 +448,6 @@ struct quic_af {
 			  unsigned int optlen);
 	int (*getsockopt)(struct sock *sk, int level, int optname, char __user *optval,
 			  int __user *optlen);
-};
-
-enum quic_pkt_type {
-	QUIC_PKT_VERSION_NEGOTIATION = 0xf0,
-	QUIC_PKT_INITIAL = 0x0,
-	QUIC_PKT_0RTT = 0x1,
-	QUIC_PKT_HANDSHAKE = 0x2,
-	QUIC_PKT_RETRY = 0x3,
-	QUIC_PKT_SHORT = 0x4
 };
 
 enum {
@@ -949,11 +975,20 @@ int quic_crypto_initial_keys_install(struct quic_sock *qs);
 int quic_crypto_compute_ecdh_secret(struct quic_sock *qs, u8 *x, u8 *y);
 int quic_crypto_handshake_keys_install(struct quic_sock *qs);
 int quic_crypto_application_keys_install(struct quic_sock *qs);
+int quic_crypto_early_keys_prepare(struct quic_sock *qs);
+int quic_crypto_early_keys_install(struct quic_sock *qs);
+int quic_crypto_early_binder_create(struct quic_sock *qs, u8 *v, u32 len);
+int quic_crypto_rms_key_install(struct quic_sock *qs);
 int quic_crypto_server_cert_verify(struct quic_sock *qs);
 int quic_crypto_server_certvfy_sign(struct quic_sock *qs);
 int quic_crypto_server_certvfy_verify(struct quic_sock *qs);
 int quic_crypto_server_finished_create(struct quic_sock *qs, u8 *sf);
 int quic_crypto_server_finished_verify(struct quic_sock *qs);
+int quic_crypto_client_finished_create(struct quic_sock *qs, u8 *cf);
+int quic_crypto_client_finished_verify(struct quic_sock *qs);
+int quic_crypto_psk_create(struct quic_sock *qs, u8 *pskid, u32 pskid_len,
+			   u8 *nonce, u32 nonce_len, u8 *mskey, u32 mskey_len);
+void quic_crypto_psk_free(struct quic_sock *qs);
 
 /* input.c */
 int quic_rcv(struct sk_buff *skb);
@@ -961,6 +996,7 @@ int quic_do_rcv(struct sock *sk, struct sk_buff *skb);
 int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb);
 void quic_receive_list_del(struct quic_sock *qs, u32 sid);
 int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[]);
+int quic_evt_notify_ticket(struct quic_sock *qs);
 void quic_receive_list_free(struct quic_sock *qs);
 
 /* output.c */

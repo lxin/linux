@@ -53,6 +53,12 @@ static int quic_frame_ch_crypto_init(struct quic_sock *qs)
 		return -ENOMEM;
 
 	ch->extensions_len = 8 + 8 + 7 + 75 + (4 + quic_frame_params_len_get(qs));
+	if (qs->crypt.psks) {
+		ch->extensions_len += 4; /* early data indication */
+		ch->extensions_len += 4 + 1 + 1; /* psk mode */
+		ch->extensions_len += 4 + 2 + 2 + qs->crypt.psks->pskid.len + 4; /* pskid */
+		ch->extensions_len += 3 + 32; /* binder */
+	}
 	ch->length = 2 + 32 + 1 + ch->session_id_len + 2 + ch->cipher_suites_len +
 			1 + ch->compression_methods_len + 2 + ch->extensions_len;
 
@@ -61,8 +67,8 @@ static int quic_frame_ch_crypto_init(struct quic_sock *qs)
 
 static int quic_frame_ch_crypto_create(struct quic_sock *qs)
 {
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_INITIAL];
 	struct quic_param *pm = &qs->params.local;
-	struct quic_vlen *f = &qs->frame.f[0];
 	struct quic_initial_param *ch;
 	u32 f_len, h_len;
 	u8 *p, *tmp;
@@ -141,6 +147,30 @@ static int quic_frame_ch_crypto_create(struct quic_sock *qs)
 	p = quic_put_varint(p, QUIC_PARAM_initial_source_connection_id);
 	p = quic_put_varint(p, qs->cids.scid.cur->len);
 	p = quic_put_pkt_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
+	if (qs->crypt.psks) {
+		p = quic_put_pkt_num(p, QUIC_EXT_early_data, 2);
+		p = quic_put_pkt_num(p, 0, 2);
+
+		p = quic_put_pkt_num(p, QUIC_EXT_psk_kex_modes, 2);
+		p = quic_put_pkt_num(p, 2, 2);
+		p = quic_put_pkt_num(p, 1, 1);
+		p = quic_put_pkt_num(p, 1, 1); /* psk_dhe_ke */
+
+		p = quic_put_pkt_num(p, QUIC_EXT_psk, 2);
+		p = quic_put_pkt_num(p, 2 + 2 + qs->crypt.psks->pskid.len + 4 + 3 + 32, 2);
+
+		p = quic_put_pkt_num(p, 2 + qs->crypt.psks->pskid.len + 4, 2);
+		p = quic_put_pkt_num(p, qs->crypt.psks->pskid.len, 2);
+		p = quic_put_pkt_data(p, qs->crypt.psks->pskid.v, qs->crypt.psks->pskid.len);
+		p = quic_put_pkt_num(p, qs->crypt.psks->psk_sent_at, 4);
+		err = quic_crypto_early_binder_create(qs, tmp, (u32)(p - tmp));
+		if (err)
+			return err;
+
+		p = quic_put_pkt_num(p, 33, 2);
+		p = quic_put_pkt_num(p, 32, 1);
+		p = quic_put_pkt_data(p, qs->crypt.binder_secret, 32);
+	}
 
 	f_len = 2 + quic_put_varint_len(h_len) + h_len;
 	f->len += f_len;
@@ -169,6 +199,11 @@ static int quic_frame_sh_crypto_init(struct quic_sock *qs)
 	memcpy(sh->cipher_suites, &cipher_suites, sh->cipher_suites_len);
 
 	sh->extensions_len = 6 + 73;
+	if (qs->crypt.psks) {
+		sh->extensions_len += 4; /* early data indication */
+		sh->extensions_len += 4 + 1 + 1; /* psk mode */
+		sh->extensions_len += 4 + 2; /* pskid selected_identity */
+	}
 	sh->length = 2 + 32 + 1 + sh->session_id_len + sh->cipher_suites_len +
 			1 + sh->compression_methods_len + 2 + sh->extensions_len;
 
@@ -177,7 +212,7 @@ static int quic_frame_sh_crypto_init(struct quic_sock *qs)
 
 static int quic_frame_sh_crypto_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[0];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_INITIAL];
 	struct quic_initial_param *sh;
 	u32 f_len, h_len;
 	struct sock *sk;
@@ -216,6 +251,19 @@ static int quic_frame_sh_crypto_create(struct quic_sock *qs)
 	p = quic_put_pkt_num(p, 4, 1);
 	p = quic_put_pkt_data(p, qs->crypt.ecdh_x, QUIC_ECDHLEN);
 	p = quic_put_pkt_data(p, qs->crypt.ecdh_y, QUIC_ECDHLEN);
+	if (qs->crypt.psks) {
+		p = quic_put_pkt_num(p, QUIC_EXT_early_data, 2);
+		p = quic_put_pkt_num(p, 0, 2);
+
+		p = quic_put_pkt_num(p, QUIC_EXT_psk_kex_modes, 2);
+		p = quic_put_pkt_num(p, 2, 2);
+		p = quic_put_pkt_num(p, 1, 1);
+		p = quic_put_pkt_num(p, 1, 1); /* psk_dhe_ke */
+
+		p = quic_put_pkt_num(p, QUIC_EXT_psk, 2);
+		p = quic_put_pkt_num(p, 2, 2);
+		p = quic_put_pkt_num(p, 0, 2);
+	}
 
 	f_len = 2 + quic_put_varint_len(h_len) + h_len;
 	f->len += f_len;
@@ -238,7 +286,7 @@ static int quic_frame_sh_crypto_create(struct quic_sock *qs)
 
 static int quic_frame_ack_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[qs->packet.type / 2];
+	struct quic_vlen *f = &qs->frame.f[qs->packet.type];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -258,7 +306,7 @@ static int quic_frame_ack_create(struct quic_sock *qs)
 
 static int quic_frame_ping_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[qs->packet.type / 2];
+	struct quic_vlen *f = &qs->frame.f[qs->packet.type];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -284,7 +332,7 @@ static int quic_frame_new_token_create(struct quic_sock *qs)
 
 static int quic_frame_stream_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[qs->packet.type];
 	struct iov_iter *msg = qs->frame.stream.msg;
 	u32 mlen = iov_iter_count(msg), hlen, off;
 	u32 mss = qs->frame.stream.mss;
@@ -323,10 +371,10 @@ static int quic_frame_stream_create(struct quic_sock *qs)
 	}
 	quic_put_varint(tmp, flag);
 
-	pr_debug("create stream hlen: %u, mlen: %u, mss: %u, off: %u\n",
-		 hlen, mlen, mss, off);
 	if (!copy_from_iter_full(p, mlen, msg))
 		return -EFAULT;
+	pr_debug("create stream hlen: %u, mlen: %u, mss: %u, off: %u\n",
+		 hlen, mlen, mss, off);
 
 	if (flag & 0x01)
 		strm->snd_state = QUIC_STRM_L_SENT;
@@ -339,7 +387,7 @@ static int quic_frame_stream_create(struct quic_sock *qs)
 
 static int quic_frame_handshake_done_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p = f->v + f->len;
 
 	p = quic_put_varint(p, 0x1e);
@@ -349,18 +397,29 @@ static int quic_frame_handshake_done_create(struct quic_sock *qs)
 
 static int quic_frame_hs_fin_crypto_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[1];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_HANDSHAKE];
+	u8 cf[QUIC_HKDF_HASHLEN], *p, *tmp;
 	u32 f_len;
-	u8 *p;
+	int err;
 
 	p = f->v + f->len;
 	p = quic_put_varint(p, QUIC_FRAME_CRYPTO);
 	p = quic_put_varint(p, 0x00);
 	p = quic_put_varint(p, 36);
+	err = quic_crypto_client_finished_create(qs, cf);
+	if (err)
+		return err;
+	tmp = p;
 	p = quic_put_pkt_num(p, QUIC_MT_FINISHED, 1);
 	p = quic_put_pkt_num(p, 32, 3);
-	p = quic_put_pkt_data(p, qs->crypt.hs_buf[QUIC_H_CFIN].v,
-			      qs->crypt.hs_buf[QUIC_H_CFIN].len);
+	p = quic_put_pkt_data(p, cf, QUIC_HKDF_HASHLEN);
+	qs->crypt.hs_buf[QUIC_H_CFIN].len = (u32)(p - tmp);
+	qs->crypt.hs_buf[QUIC_H_CFIN].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CFIN].len);
+	if (!qs->crypt.hs_buf[QUIC_H_CFIN].v)
+		return -ENOMEM;
+	err = quic_crypto_rms_key_install(qs);
+	if (err)
+		return err;
 	f_len = 39;
 	f->len += f_len;
 	pr_debug("client crypto finished frame len: %u\n", f_len);
@@ -370,8 +429,8 @@ static int quic_frame_hs_fin_crypto_create(struct quic_sock *qs)
 
 static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 {
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_HANDSHAKE];
 	struct quic_param *pm = &qs->params.local;
-	struct quic_vlen *f = &qs->frame.f[1];
 	u32 f_len, m_len, p_len, clen, t_len;
 	u8 *p, *tmp, sf[QUIC_HKDF_HASHLEN];
 	u32 e_len, c_len, v_len, fin_len;
@@ -381,14 +440,17 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	if (mss < 0)
 		return mss;
 
-	clen = qs->crypt.crt.len;
 	p_len = quic_frame_params_len_get(qs);
 
 	e_len = 4 + (2 + 8 + (4 + p_len));
-	c_len = 4 + (2 + clen + 3) + 4;
-	v_len = 4 + (2 + 2 + 256);
 	fin_len = 4 + QUIC_HKDF_HASHLEN;
-	t_len = e_len + c_len + v_len + fin_len;
+	t_len = e_len + fin_len;
+	if (!qs->crypt.psks) {
+		clen = qs->crypt.crt.len;
+		c_len = 4 + (2 + clen + 3) + 4;
+		v_len = 4 + (2 + 2 + 256);
+		t_len += c_len + v_len;
+	}
 
 	m_len = t_len;
 	if (m_len > mss - 4)
@@ -445,6 +507,9 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	if (!qs->crypt.hs_buf[QUIC_H_EE].v)
 		return -ENOMEM;
 
+	if (qs->crypt.psks)
+		goto fin;
+
 	tmp = p;
 	p = quic_put_pkt_num(p, QUIC_MT_CERTIFICATE, 1);
 	p = quic_put_pkt_num(p, 2 + clen + 3 + 4, 3);
@@ -476,9 +541,11 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	if (!qs->crypt.hs_buf[QUIC_H_CVFY].v)
 		return -ENOMEM;
 
+fin:
 	err = quic_crypto_server_finished_create(qs, sf);
 	if (err)
 		return err;
+
 	tmp = p;
 	p = quic_put_pkt_num(p, QUIC_MT_FINISHED, 1);
 	p = quic_put_pkt_num(p, QUIC_HKDF_HASHLEN, 3);
@@ -491,10 +558,9 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	tmp = f->v + f->len + 4;
 	f_len = 4 + m_len;
 	f->len += f_len;
-	pr_debug("hs_crypto p_len: %u, e_len: %u, f_len: %u, c_len: %u\n",
-		 p_len, e_len, f_len, c_len);
+	pr_debug("hs_crypto p_len: %u, e_len: %u, f_len: %u\n", p_len, e_len, f_len);
 	if (m_len < t_len) {
-		f = &qs->frame.f[3];
+		f = &qs->frame.f[QUIC_FR_NR - 1];
 
 		t_len = t_len - m_len;
 		p = f->v + f->len;
@@ -510,6 +576,43 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	return quic_crypto_application_keys_install(qs);
 }
 
+static int quic_frame_ticket_crypto_create(struct quic_sock *qs)
+{
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
+	struct quic_psk *psk = qs->crypt.psks;
+	u32 f_len, len;
+	u8 *p;
+
+	pr_debug("send ticket %u %u: %8phN(%u), %8phN(%u), %8phN(%u)\n",
+		 psk->psk_sent_at, psk->psk_expire,
+		 psk->pskid.v, psk->pskid.len, psk->nonce.v,
+		 psk->nonce.len, psk->mskey.v, psk->mskey.len);
+
+	p = f->v + f->len;
+	len = 4 + 4 + 4 + 1 + psk->nonce.len + 2 + psk->pskid.len + 10;
+	p = quic_put_varint(p, QUIC_FRAME_CRYPTO);
+	p = quic_put_varint(p, 0x00);
+	p = quic_put_varint(p, len);
+	p = quic_put_pkt_num(p, QUIC_MT_NEWSESSION_TICKET, 1);
+	p = quic_put_pkt_num(p, len - 4, 3);
+	p = quic_put_pkt_num(p, psk->psk_expire, 4);
+	p = quic_put_pkt_num(p, psk->psk_sent_at, 4);
+	p = quic_put_pkt_num(p, psk->nonce.len, 1);
+	p = quic_put_pkt_data(p, psk->nonce.v, psk->nonce.len);
+	p = quic_put_pkt_num(p, psk->pskid.len, 2);
+	p = quic_put_pkt_data(p, psk->pskid.v, psk->pskid.len);
+	p = quic_put_pkt_num(p, 2 + 2 + 4, 2);
+	p = quic_put_pkt_num(p, QUIC_EXT_early_data, 2);
+	p = quic_put_pkt_num(p, 4, 2);
+	p = quic_put_pkt_num(p, 0xffffffff, 4);
+
+	f_len = len + 3;
+	f->len += f_len;
+	pr_debug("client crypto finished frame len: %u\n", f_len);
+
+	return 0;
+}
+
 static int quic_frame_crypto_create(struct quic_sock *qs)
 {
 	if (qs->state == QUIC_CS_CLIENT_INITIAL)
@@ -520,12 +623,14 @@ static int quic_frame_crypto_create(struct quic_sock *qs)
 		return quic_frame_sh_crypto_create(qs);
 	if (qs->state == QUIC_CS_SERVER_WAIT_HANDSHAKE)
 		return quic_frame_hs_crypto_create(qs);
+	if (qs->state == QUIC_CS_SERVER_POST_HANDSHAKE)
+		return quic_frame_ticket_crypto_create(qs);
 	return -EINVAL;
 }
 
 static int quic_frame_retire_connection_id_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -542,7 +647,7 @@ static int quic_frame_retire_connection_id_create(struct quic_sock *qs)
 
 static int quic_frame_new_connection_id_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	struct net *net = sock_net(&qs->inet.sk);
 	struct quic_hash_head *head;
 	struct quic_cid *cid, *n;
@@ -594,7 +699,7 @@ static int quic_frame_new_connection_id_create(struct quic_sock *qs)
 
 static int quic_frame_path_response_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -612,7 +717,7 @@ static int quic_frame_path_response_create(struct quic_sock *qs)
 
 static int quic_frame_path_challenge_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -631,7 +736,7 @@ static int quic_frame_path_challenge_create(struct quic_sock *qs)
 
 static int quic_frame_reset_stream_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	struct quic_strm *strm;
 	u8 *p, *tmp;
 	u32 f_len;
@@ -654,7 +759,7 @@ static int quic_frame_reset_stream_create(struct quic_sock *qs)
 
 static int quic_frame_stop_sending_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	struct quic_strm *strm;
 	u8 *p, *tmp;
 	u32 f_len;
@@ -676,7 +781,7 @@ static int quic_frame_stop_sending_create(struct quic_sock *qs)
 
 static int quic_frame_max_data_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -693,7 +798,7 @@ static int quic_frame_max_data_create(struct quic_sock *qs)
 
 static int quic_frame_max_stream_data_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -711,7 +816,7 @@ static int quic_frame_max_stream_data_create(struct quic_sock *qs)
 
 static int quic_frame_max_streams_uni_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -728,7 +833,7 @@ static int quic_frame_max_streams_uni_create(struct quic_sock *qs)
 
 static int quic_frame_max_streams_bidi_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -745,7 +850,7 @@ static int quic_frame_max_streams_bidi_create(struct quic_sock *qs)
 
 static int quic_frame_connection_close_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -765,7 +870,7 @@ static int quic_frame_connection_close_create(struct quic_sock *qs)
 
 static int quic_frame_data_blocked_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -782,7 +887,7 @@ static int quic_frame_data_blocked_create(struct quic_sock *qs)
 
 static int quic_frame_stream_data_blocked_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -800,7 +905,7 @@ static int quic_frame_stream_data_blocked_create(struct quic_sock *qs)
 
 static int quic_frame_streams_blocked_uni_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -817,7 +922,7 @@ static int quic_frame_streams_blocked_uni_create(struct quic_sock *qs)
 
 static int quic_frame_streams_blocked_bidi_create(struct quic_sock *qs)
 {
-	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_SHORT];
 	u8 *p, *tmp;
 	u32 f_len;
 
@@ -1104,7 +1209,6 @@ static int quic_frame_handshake_done_process(struct quic_sock *qs, u8 **ptr, u8 
 	u8 *p = *ptr;
 
 	pr_debug("Handshake Done\n");
-	p++;
 	*ptr = p;
 	return 0;
 }
@@ -1298,6 +1402,7 @@ static int quic_frame_max_streams_bidi_process(struct quic_sock *qs, u8 **ptr, u
 
 static int quic_frame_connection_close_process(struct quic_sock *qs, u8 **ptr, u8 type, u32 left)
 {
+	struct sock *sk = &qs->inet.sk;
 	u8 *p = *ptr;
 	u32 v, len;
 
@@ -1313,6 +1418,7 @@ static int quic_frame_connection_close_process(struct quic_sock *qs, u8 **ptr, u
 	pr_debug("Connection Close Reason Phrase Length %u\n", len);
 	p += len;
 	qs->state = QUIC_CS_CLOSING;
+	sk->sk_data_ready(sk);
 
 	*ptr = p;
 	return 0;

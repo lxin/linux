@@ -41,6 +41,7 @@ enum quic_evt_type {
 	QUIC_EVT_CIDS,		/* NEW, DEL, CUR */
 	QUIC_EVT_STREAMS,	/* RESET, STOP, MAX, BLOCKED */
 	QUIC_EVT_ADDRESS,	/* NEW */
+	QUIC_EVT_TICKET,	/* NEW */
 	QUIC_EVT_MAX,
 };
 
@@ -61,10 +62,15 @@ enum quic_evt_addr_type {
 	QUIC_EVT_ADDRESS_NEW,
 };
 
+enum quic_evt_ticket_type {
+	QUIC_EVT_TICKET_NEW,
+};
+
 struct quic_evt_msg {
 	u8 evt_type;
 	u8 sub_type;
 	u32 value[3];
+	u8 data[];
 };
 
 /* certificate and private key */
@@ -91,6 +97,10 @@ struct quic_evt_msg {
 /* event */
 #define QUIC_SOCKOPT_EVENT		13
 #define QUIC_SOCKOPT_EVENTS		14
+
+/* ticket */
+#define QUIC_SOCKOPT_NEW_TICKET		15
+#define QUIC_SOCKOPT_LOAD_TICKET	16
 
 #define MSG_NOTIFICATION		0x8000
 

@@ -200,7 +200,8 @@ int quic_write_queue_flush(struct quic_sock *qs)
 		return err;
 
 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL) {
-		if (QUIC_SND_CB(skb)->has_strm) {
+		if (QUIC_SND_CB(skb)->type == QUIC_PKT_SHORT &&
+		    QUIC_SND_CB(skb)->has_strm) {
 			if (quic_write_flow_control(qs, skb))
 				break;
 			n = skb_clone(skb, GFP_ATOMIC);
@@ -335,6 +336,7 @@ void quic_send_queue_check(struct quic_sock *qs, u32 v)
 	struct sk_buff *prev = skb, *next;
 	struct quic_strm *strm;
 	u32 rtt;
+	int err;
 
 	while (skb) {
 		if (QUIC_SND_CB(skb)->pn > v)
@@ -369,7 +371,31 @@ void quic_send_queue_check(struct quic_sock *qs, u32 v)
 		break;
 	}
 
-	if (qs->inet.sk.sk_send_head || qs->packet.fc_md || qs->packet.fc_msd) {
+	if (qs->packet.ticket && QUIC_SND_CB(qs->packet.ticket)->pn == v) {
+		kfree_skb(qs->packet.ticket);
+		qs->packet.ticket = NULL;
+		err = quic_evt_notify_ticket(qs);
+		if (err) {
+			qs->inet.sk.sk_err = err;
+			pr_warn("notify ticket fails %d\n", err);
+		}
+		if (qs->lsk && qs->crypt.psks) {
+			struct quic_psk *psk = qs->lsk->crypt.psks;
+
+			if (psk) {
+				while (psk->next)
+					psk = psk->next;
+				psk->next = qs->crypt.psks;
+				qs->crypt.psks = NULL;
+			} else {
+				qs->lsk->crypt.psks = qs->crypt.psks;
+				qs->crypt.psks = NULL;
+			}
+		}
+	}
+
+	if (qs->inet.sk.sk_send_head || qs->packet.fc_md || qs->packet.fc_msd ||
+	    qs->packet.ticket) {
 		quic_start_rtx_timer(qs, 1);
 		return;
 	}

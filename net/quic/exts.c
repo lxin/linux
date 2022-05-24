@@ -104,12 +104,67 @@ static int quic_exts_supported_versions_process(struct quic_sock *qs, u8 *p, u32
 	return -ENOENT;
 }
 
+static int quic_exts_psk(struct quic_sock *qs, u8 *p, u32 len)
+{
+	u32 pskid_len, binder_len, v, age_add;
+	struct quic_psk *psk;
+	u8 *pskid, *binder;
+	int err = -EINVAL;
+
+	if (!(qs->state > QUIC_CS_CLOSING)) {
+		v = quic_get_fixint_next(&p, 2);
+
+		pr_debug("psk selected_identity %u\n", v);
+		return 0;
+	}
+
+	len = quic_get_fixint_next(&p, 2);
+	pskid_len = quic_get_fixint_next(&p, 2);
+	pskid = p;
+	p += pskid_len;
+	age_add = quic_get_fixint_next(&p, 4);
+
+	for (psk = qs->lsk->crypt.psks; psk; psk = psk->next) {
+		if (pskid_len == psk->pskid.len &&
+		    !memcmp(pskid, psk->pskid.v, pskid_len))
+			break;
+	}
+	if (!psk)
+		return err;
+
+	err = quic_crypto_psk_create(qs, psk->pskid.v, psk->pskid.len, psk->nonce.v,
+				     psk->nonce.len, psk->mskey.v, psk->mskey.len);
+	if (err)
+		return err;
+	err = quic_crypto_early_keys_prepare(qs);
+	if (err)
+		return err;
+
+	len = quic_get_fixint_next(&p, 2);
+	binder_len = quic_get_fixint_next(&p, 1);
+	binder = p;
+	err = quic_crypto_early_binder_create(qs, qs->crypt.hs_buf[QUIC_H_CH].v,
+					      qs->crypt.hs_buf[QUIC_H_CH].len - len - 2);
+	if (err)
+		return err;
+	pr_debug("psk binder %32phN, %32phN\n", binder, qs->crypt.binder_secret);
+
+	return memcmp(binder, qs->crypt.binder_secret, binder_len);
+}
+
 static int quic_exts_early_data_process(struct quic_sock *qs, u8 *p, u32 len)
 {
 	u32 v;
 
+	if (qs->packet.type != QUIC_PKT_SHORT) {
+		pr_debug("max_early_data_size recvd\n");
+		return 0;
+	}
+
 	v = quic_get_fixint_next(&p, 4);
 	pr_debug("max_early_data_size %u\n", v);
+	if (v != 0xffffffff)
+		return 1;
 
 	return 0;
 }
@@ -172,8 +227,19 @@ static int quic_exts_signature_algorithms(struct quic_sock *qs, u8 *p, u32 len)
 
 static int quic_exts_psk_kex_modes(struct quic_sock *qs, u8 *p, u32 len)
 {
-	pr_debug("psk_kex_modes\n");
-	return 0;
+	int i;
+	u32 v;
+
+	len = quic_get_fixint_next(&p, 1);
+	for (i = 0; i < len; i++) {
+		v = quic_get_fixint_next(&p, 1);
+		if (v == 1) {
+			pr_debug("psk_kex_modes psk_dhe_ke\n");
+			return 0;
+		}
+	}
+	pr_debug("psk_kex_modes not supported\n");
+	return 1;
 }
 
 static int quic_exts_transport_parameters_draft_process(struct quic_sock *qs, u8 *p, u32 len)
@@ -224,7 +290,7 @@ static struct quic_ext_ops quic_exts[QUIC_EXT_MAX + 1] = {
 	{quic_exts_unsupported},
 	{quic_exts_unsupported},
 	{quic_exts_unsupported},
-	{quic_exts_unsupported},
+	{quic_exts_psk},
 	{quic_exts_early_data_process},
 	{quic_exts_supported_versions_process},
 	{quic_exts_unsupported},
@@ -261,12 +327,13 @@ int quic_exts_process(struct quic_sock *qs, u8 *p)
 				pr_err_once("crypto frame: unsupported extension %u\n", v);
 				err = -EPROTONOSUPPORT;
 			}
-			if (err)
-				return err;
+		} else {
+			err = quic_exts[v].ext_process(qs, p, len);
 		}
-		err = quic_exts[v].ext_process(qs, p, len);
-		if (err)
+		if (err) {
+			pr_err("ext err: %u %d\n", v, err);
 			return err;
+		}
 
 		p += len;
 		if ((u32)(p - exts_p) >= exts_len)

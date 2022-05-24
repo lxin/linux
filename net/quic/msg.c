@@ -118,11 +118,12 @@ static int quic_msg_client_finished_process(struct quic_sock *qs, u8 *p, u32 len
 	struct sock *sk = &qs->inet.sk;
 	int err;
 
-	err = (len != qs->crypt.hs_buf[QUIC_H_CFIN].len ||
-	       memcmp(p, qs->crypt.hs_buf[QUIC_H_CFIN].v, len));
-	pr_debug("client finished verified %d\n", err);
+	qs->crypt.hs_buf[QUIC_H_CFIN].len = len + 4;
+	qs->crypt.hs_buf[QUIC_H_CFIN].v = quic_mem_dup(p - 4, qs->crypt.hs_buf[QUIC_H_CFIN].len);
+	err = quic_crypto_client_finished_verify(qs);
 	if (err)
 		return err;
+
 	err = quic_frame_create(qs, QUIC_FRAME_HANDSHAKE_DONE);
 	if (err)
 		return err;
@@ -143,25 +144,49 @@ static int quic_msg_finished_process(struct quic_sock *qs, u8 *p, u32 len)
 
 static int quic_msg_newsession_ticket_process(struct quic_sock *qs, u8 *p, u32 len)
 {
+	u32 v, expire, nonce_len, pskid_len, age_add;
+	struct quic_psk *psks;
+	u8 *nonce, *pskid;
 	int err;
-	u32 v;
 
 	v = quic_get_fixint_next(&p, 4);
+	expire = v;
 	pr_debug("ticket_lifetime: %u\n", v);
 	v = quic_get_fixint_next(&p, 4);
 	pr_debug("ticket_age_add: %u\n", v);
+	age_add = v;
+
 	len = quic_get_fixint_next(&p, 1);
 	pr_debug("ticket_nonce len: %u\n", len);
+	nonce_len = len;
+	nonce = p;
 	p += len;
 	len = quic_get_fixint_next(&p, 2);
 	pr_debug("ticket len: %u\n", len);
+	pskid_len = len;
+	pskid = p;
 	p += len;
+
+	err = quic_crypto_psk_create(qs, pskid, pskid_len, nonce, nonce_len,
+				     qs->crypt.rms_secret, QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+	psks = qs->crypt.psks;
+	psks->psk_expire = expire;
+	psks->psk_sent_at = age_add;
+	pr_debug("recv ticket %u %u: %8phN(%u), %8phN(%u), %8phN(%u)\n",
+		 psks->psk_sent_at, psks->psk_expire,
+		 psks->pskid.v, psks->pskid.len, psks->nonce.v,
+		 psks->nonce.len, psks->mskey.v, psks->mskey.len);
 
 	err = quic_exts_process(qs, p);
 	if (err)
-		return err;
-
-	return 0;
+		goto out;
+	pr_debug("ticket done\n");
+	err = quic_evt_notify_ticket(qs);
+out:
+	quic_crypto_psk_free(qs);
+	return err;
 }
 
 static int quic_msg_client_hello_process(struct quic_sock *qs, u8 *p, u32 len)
@@ -189,6 +214,9 @@ static int quic_msg_client_hello_process(struct quic_sock *qs, u8 *p, u32 len)
 	p += len; /* compression = 0 */
 
 	err = quic_exts_process(qs, p);
+	if (err)
+		return err;
+	err = quic_crypto_early_keys_install(qs);
 	if (err)
 		return err;
 	err = quic_frame_create(qs, QUIC_FRAME_CRYPTO);

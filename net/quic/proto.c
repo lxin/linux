@@ -274,7 +274,7 @@ static int quic_wait_for_connect(struct sock *sk, long timeo)
 			goto out;
 		}
 
-		if (quic_sk(sk)->state != QUIC_CS_CLIENT_INITIAL)
+		if (quic_sk(sk)->state != QUIC_CS_CLIENT_WAIT_HANDSHAKE)
 			goto out;
 
 		exit = 0;
@@ -288,35 +288,19 @@ out:
 	}
 }
 
-static int quic_inet_connect(struct socket *sock, struct sockaddr *addr, int addr_len, int flags)
+static int quic_do_connect(struct sock *sk)
 {
-	struct sock *sk = sock->sk;
-	struct quic_sock *qs;
+	struct quic_sock *qs = quic_sk(sk);
 	struct sk_buff *skb;
-	u8 dcid[8], scid[8];
-	long timeo;
 	int err;
 
-	lock_sock(sk);
-	qs = quic_sk(sk);
-	if (addr->sa_family != sk->sk_family || addr_len < qs->af->addr_len ||
-	    !quic_a(addr)->v4.sin_port) {
-		err = -EINVAL;
-		goto err;
-	}
-	if (sk->sk_state == QUIC_SS_LISTENING || sk->sk_state == QUIC_SS_ESTABLISHED) {
-		err = -EISCONN;
-		goto err;
-	}
-
-	get_random_bytes(dcid, 8);
-	get_random_bytes(scid, 8);
-	qs->state = QUIC_CS_CLIENT_INITIAL;
-	err = quic_sock_init(qs, quic_a(addr), dcid, 8, scid, 8);
-	if (err)
-		goto err;
+	if (sk->sk_state == QUIC_SS_LISTENING || sk->sk_state == QUIC_SS_ESTABLISHED)
+		return -EISCONN;
 
 	err = quic_crypto_initial_keys_install(qs);
+	if (err)
+		goto init_err;
+	err = quic_crypto_early_keys_prepare(qs);
 	if (err)
 		goto init_err;
 	skb = quic_packet_create(qs, QUIC_PKT_INITIAL, QUIC_FRAME_CRYPTO);
@@ -324,7 +308,19 @@ static int quic_inet_connect(struct socket *sock, struct sockaddr *addr, int add
 		err = -ENOMEM;
 		goto init_err;
 	}
+	err = quic_crypto_early_keys_install(qs);
+	if (err)
+		goto init_err;
 	quic_write_queue_enqueue(qs, skb);
+	if (qs->frame.stream.msg) {
+		qs->frame.stream.mss -= skb->len;
+		skb = quic_packet_create(qs, QUIC_PKT_0RTT, QUIC_FRAME_STREAM);
+		if (!skb) {
+			err = -ENOMEM;
+			goto init_err;
+		}
+		quic_write_queue_enqueue(qs, skb);
+	}
 	err = quic_write_queue_flush(qs);
 	if (err)
 		goto route_err;
@@ -333,15 +329,47 @@ static int quic_inet_connect(struct socket *sock, struct sockaddr *addr, int add
 
 	qs->state = QUIC_CS_CLIENT_WAIT_HANDSHAKE;
 	inet_sk_set_state(sk, QUIC_SS_CONNECTING);
-	timeo = sock_sndtimeo(sk, flags & O_NONBLOCK);
-	err = quic_wait_for_connect(sk, timeo);
-	goto err;
+	return 0;
 
 route_err:
 	kfree_skb(skb);
 init_err:
 	quic_sock_free(qs);
-err:
+	return err;
+}
+
+static int quic_inet_connect(struct socket *sock, struct sockaddr *addr, int addr_len, int flags)
+{
+	struct sock *sk = sock->sk;
+	struct quic_sock *qs;
+	u8 dcid[8], scid[8];
+	long timeo;
+	int err;
+
+	lock_sock(sk);
+
+	get_random_bytes(dcid, 8);
+	get_random_bytes(scid, 8);
+	qs = quic_sk(sk);
+	if (addr->sa_family != sk->sk_family || addr_len < qs->af->addr_len ||
+	    !quic_a(addr)->v4.sin_port) {
+		err = -EINVAL;
+		goto out;
+	}
+	qs->state = QUIC_CS_CLIENT_INITIAL;
+	err = quic_sock_init(qs, quic_a(addr), dcid, 8, scid, 8);
+	if (err)
+		return err;
+
+	err = quic_do_connect(sk);
+	if (err) {
+		quic_sock_free(qs);
+		goto out;
+	}
+
+	timeo = sock_sndtimeo(sk, flags & O_NONBLOCK);
+	err = quic_wait_for_connect(sk, timeo);
+out:
 	release_sock(sk);
 	return err;
 }
@@ -349,18 +377,28 @@ err:
 static void quic_close(struct sock *sk, long timeout)
 {
 	struct quic_sock *qs = quic_sk(sk);
+	struct sk_buff *skb;
 
 	lock_sock(sk);
 	if (sk->sk_state == QUIC_SS_LISTENING) {
 		struct quic_hash_head *head;
 
-		head = quic_lsk_head(sock_net(sk), quic_saddr_cur(qs));
-		spin_lock(&head->lock);
-		hlist_del(&qs->node);
-		spin_unlock(&head->lock);
+		if (!hlist_unhashed(&qs->node)) {
+			head = quic_lsk_head(sock_net(sk), quic_saddr_cur(qs));
+			spin_lock(&head->lock);
+			hlist_del(&qs->node);
+			spin_unlock(&head->lock);
+		}
 	} else if (sk->sk_state != QUIC_SS_CLOSED) {
 		pr_info("close %u %u\n", READ_ONCE(sk->sk_sndbuf),
 			READ_ONCE(sk->sk_wmem_queued));
+		qs->frame.close.err = QUIC_ERROR_NO_ERROR;
+		skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_CONNECTION_CLOSE_APP);
+		if (skb) {
+			quic_write_queue_enqueue(qs, skb);
+			quic_write_queue_flush(qs);
+		}
+		qs->state = QUIC_CS_CLOSING;
 		quic_sock_free(qs);
 	}
 
@@ -444,6 +482,12 @@ int quic_dst_mss_check(struct quic_sock *qs, int hdr)
 		mss -= (quic_put_varint_len(qs->token.len) + qs->token.len);
 		mss -= (4 + 2);
 		mss -= QUIC_TAGLEN;
+	} else if (hdr == 3) {
+		mss -= (qs->af->iphdr_len + sizeof(struct udphdr));
+		mss -= (sizeof(struct quic_lhdr) + 4);
+		mss -= (1 + qs->cids.dcid.cur->len + 1 + qs->cids.scid.cur->len);
+		mss -= (4 + 2);
+		mss -= QUIC_TAGLEN;
 	}
 
 	return mss;
@@ -498,7 +542,9 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 {
 	struct quic_sock *qs = quic_sk(sk);
 	struct quic_strm *strm;
+	struct sockaddr *addr;
 	struct quic_sndinfo s;
+	u8 dcid[8], scid[8];
 	struct sk_buff *skb;
 	int err, mss;
 	long timeo;
@@ -512,6 +558,47 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 	if (qs->state == QUIC_CS_CLOSING) {
 		err = -EPIPE;
 		goto err;
+	}
+
+	if (qs->state == QUIC_CS_CLOSED) { /* 0RTT data */
+		if (!qs->crypt.psks || !msg->msg_name) {
+			err = -EPIPE;
+			goto err;
+		}
+
+		get_random_bytes(dcid, 8);
+		get_random_bytes(scid, 8);
+
+		addr = msg->msg_name;
+		if (addr->sa_family != sk->sk_family || msg->msg_namelen < qs->af->addr_len ||
+		    !quic_a(addr)->v4.sin_port) {
+			err = -EINVAL;
+			goto err;
+		}
+		qs->state = QUIC_CS_CLIENT_INITIAL;
+		err = quic_sock_init(qs, quic_a(addr), dcid, 8, scid, 8);
+		if (err)
+			goto err;
+
+		mss = quic_dst_mss_check(qs, 3);
+		if (mss < 0) {
+			err = mss;
+			goto err;
+		}
+
+		qs->frame.stream.mss = mss;
+		qs->frame.stream.sid = s.stream_id;
+		qs->frame.stream.msg = &msg->msg_iter;
+		qs->frame.stream.fin = msg->msg_flags & MSG_EOR;
+		err = quic_do_connect(sk);
+		if (err)
+			goto err;
+		timeo = sock_sndtimeo(sk, 0);
+		err = quic_wait_for_connect(sk, timeo);
+		if (err)
+			goto err;
+		if (!iov_iter_count(qs->frame.stream.msg))
+			goto out;
 	}
 
 	mss = quic_dst_mss_check(qs, 1);
@@ -536,7 +623,6 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 	qs->frame.stream.sid = s.stream_id;
 	qs->frame.stream.msg = &msg->msg_iter;
 	qs->frame.stream.fin = msg->msg_flags & MSG_EOR;
-
 	while (iov_iter_count(qs->frame.stream.msg) > 0) {
 		if (quic_stream_wspace(sk) <= 0) {
 			timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
@@ -550,7 +636,7 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 			qs->frame.stream.fin = msg->msg_flags & MSG_EOR;
 		}
 
-		qs->packet.f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+		qs->packet.f = &qs->frame.f[QUIC_PKT_SHORT];
 		skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_STREAM);
 		if (!skb) {
 			err = -ENOMEM;
@@ -564,6 +650,7 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 		if (err)
 			goto err;
 	}
+out:
 	release_sock(sk);
 	return msg_len;
 err:
@@ -573,6 +660,8 @@ err:
 
 static int quic_wait_for_packet(struct sock *sk, long timeo)
 {
+	struct quic_sock *qs = quic_sk(sk);
+
 	for (;;) {
 		int err = 0, exit = 1;
 		DEFINE_WAIT(wait);
@@ -590,6 +679,14 @@ static int quic_wait_for_packet(struct sock *sk, long timeo)
 		if (signal_pending(current))
 			goto out;
 
+		if (qs->state != QUIC_CS_CLIENT_WAIT_HANDSHAKE &&
+		    qs->state != QUIC_CS_SERVER_WAIT_HANDSHAKE &&
+		    qs->state != QUIC_CS_CLIENT_POST_HANDSHAKE &&
+		    qs->state != QUIC_CS_SERVER_POST_HANDSHAKE) {
+			err = -EPIPE;
+			pr_warn("wait packet state %u, %d\n", qs->state, err);
+			goto out;
+		}
 		if (sk->sk_err) {
 			err = sk->sk_err;
 			pr_warn("wait rcv pkt sk_err %d\n", err);
@@ -1015,6 +1112,77 @@ static int quic_setsockopt_events(struct sock *sk, u32 *events, unsigned int len
 	return 0;
 }
 
+static int quic_setsockopt_new_ticket(struct sock *sk, u8 *pskid, unsigned int len)
+{
+	struct quic_sock *qs = quic_sk(sk);
+	struct sk_buff *skb;
+	u8 nonce[8];
+	int err;
+
+	if (len < sizeof(*pskid) || qs->state != QUIC_CS_SERVER_POST_HANDSHAKE ||
+	    qs->crypt.psks)
+		return -EINVAL;
+
+	get_random_bytes(nonce, 8);
+	err = quic_crypto_psk_create(qs, pskid, len, nonce, 8,
+				     qs->crypt.rms_secret, QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+
+	qs->packet.ticket = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_CRYPTO);
+	if (!qs->packet.ticket) {
+		quic_crypto_psk_free(qs);
+		return -ENOMEM;
+	}
+
+	skb = skb_clone(qs->packet.ticket, GFP_ATOMIC);
+	if (skb) {
+		skb_set_owner_w(skb, sk);
+		qs->af->lower_xmit(qs, skb);
+		quic_start_rtx_timer(qs, 0);
+	}
+
+	return 0;
+}
+
+static int quic_setsockopt_load_ticket(struct sock *sk, u8 *psk, unsigned int len)
+{
+	u32 expire, sent_at, *p = (u32 *)psk;
+	u32 nonce_len, pskid_len, mskey_len;
+	struct quic_sock *qs = quic_sk(sk);
+	u8 *nonce, *pskid, *mskey;
+	struct quic_psk *psks;
+	int err;
+
+	if (len < 20 || qs->state != QUIC_CS_CLOSED || qs->crypt.psks)
+		return -EINVAL;
+
+	pskid_len = *p++;
+	nonce_len = *p++;
+	mskey_len = *p++;
+	sent_at = *p++;
+	expire = *p++;
+
+	psk = (u8 *)p;
+	pskid = psk;
+	nonce = psk + pskid_len;
+	mskey = psk + pskid_len + nonce_len;
+	err = quic_crypto_psk_create(qs, pskid, pskid_len, nonce, nonce_len,
+				     mskey, mskey_len);
+	if (err)
+		return err;
+
+	psks = qs->crypt.psks;
+	psks->psk_sent_at = sent_at + 5000;
+	psks->psk_expire = expire;
+	pr_debug("load ticket %u %u: %8phN(%u), %8phN(%u), %8phN(%u)\n",
+		 psks->psk_sent_at, psks->psk_expire,
+		 psks->pskid.v, psks->pskid.len, psks->nonce.v,
+		 psks->nonce.len, psks->mskey.v, psks->mskey.len);
+
+	return 0;
+}
+
 static int quic_setsockopt_new_cid(struct sock *sk, u32 *cid, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
@@ -1177,6 +1345,12 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 		break;
 	case QUIC_SOCKOPT_EVENTS:
 		retval = quic_setsockopt_events(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_NEW_TICKET:
+		retval = quic_setsockopt_new_ticket(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_LOAD_TICKET:
+		retval = quic_setsockopt_load_ticket(sk, kopt, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;

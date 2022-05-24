@@ -302,3 +302,39 @@ int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[])
 	sk->sk_data_ready(sk);
 	return 0;
 }
+
+int quic_evt_notify_ticket(struct quic_sock *qs)
+{
+	struct sock *sk = &qs->inet.sk;
+	struct quic_evt_msg *em;
+	struct quic_psk *psk;
+	struct sk_buff *skb;
+	u32 len;
+
+	if (!(qs->packet.events & (1 << QUIC_EVT_TICKET)))
+		return 0;
+
+	psk = qs->crypt.psks;
+	len = 8 + psk->mskey.len + psk->nonce.len + psk->pskid.len;
+	skb = alloc_skb(sizeof(*em) + len, GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	QUIC_RCV_CB(skb)->is_evt = 1;
+	em = skb_put(skb, sizeof(*em) + len);
+	em->evt_type = QUIC_EVT_TICKET;
+	em->sub_type = QUIC_EVT_TICKET_NEW;
+	em->value[0] = psk->pskid.len;
+	em->value[1] = psk->nonce.len;
+	em->value[2] = psk->mskey.len;
+	memcpy(em->data, &psk->psk_sent_at, 4);
+	memcpy(em->data + 4, &psk->psk_expire, 4);
+	memcpy(em->data + 8, psk->pskid.v, psk->pskid.len);
+	memcpy(em->data + 8 + psk->pskid.len, psk->nonce.v, psk->nonce.len);
+	memcpy(em->data + 8 + psk->pskid.len + psk->nonce.len, psk->mskey.v, psk->mskey.len);
+
+	pr_debug("event created %u %u\n", QUIC_EVT_TICKET, QUIC_EVT_TICKET_NEW);
+	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	sk->sk_data_ready(sk);
+	return 0;
+}

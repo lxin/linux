@@ -30,7 +30,7 @@ static int quic_crypto_hkdf_extract(struct quic_sock *qs, u8 *key, int key_len,
 }
 
 static int quic_crypto_hkdf_expand(struct quic_sock *qs, u8 *key, u8 *label,
-				   int llen, u8 *hash, u8 *okm, int okmlen)
+				   int llen, u8 *hash, int hlen, u8 *okm, int okmlen)
 {
 	struct crypto_shash *tfm = qs->crypt.sha_tfm;
 	static const u8 LABEL[] = "tls13 ";
@@ -52,9 +52,9 @@ static int quic_crypto_hkdf_expand(struct quic_sock *qs, u8 *key, u8 *label,
 	memcpy(p, label, llen);
 	p += llen;
 	if (hash) {
-		*p++ = okmlen;
-		memcpy(p, hash, okmlen);
-		p += okmlen;
+		*p++ = hlen;
+		memcpy(p, hash, hlen);
+		p += hlen;
 	} else {
 		*p++ = 0;
 	}
@@ -110,15 +110,15 @@ static int quic_crypto_keys_derive(struct quic_sock *qs, u8 *srt, u8 *key,
 	int llen, err;
 
 	llen = sizeof(KEY_LABEL) - 1;
-	err = quic_crypto_hkdf_expand(qs, srt, KEY_LABEL, llen, NULL, key, QUIC_KEYLEN);
+	err = quic_crypto_hkdf_expand(qs, srt, KEY_LABEL, llen, NULL, 0, key, QUIC_KEYLEN);
 	if (err)
 		return err;
 	llen = sizeof(IV_LABEL) - 1;
-	err = quic_crypto_hkdf_expand(qs, srt, IV_LABEL, llen, NULL, iv, QUIC_IVLEN);
+	err = quic_crypto_hkdf_expand(qs, srt, IV_LABEL, llen, NULL, 0, iv, QUIC_IVLEN);
 	if (err)
 		return err;
 	llen = sizeof(HP_KEY_LABEL) - 1;
-	return quic_crypto_hkdf_expand(qs, srt, HP_KEY_LABEL, llen, NULL, hp_key, QUIC_KEYLEN);
+	return quic_crypto_hkdf_expand(qs, srt, HP_KEY_LABEL, llen, NULL, 0, hp_key, QUIC_KEYLEN);
 }
 
 static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
@@ -133,7 +133,7 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 	int llen, err;
 
 	if (type == QUIC_PKT_INITIAL) {
-		i_srt = qs->crypt.es_secret;
+		i_srt = qs->crypt.init_secret;
 		hash = NULL;
 
 		tx_key = qs->crypt.tx_key;
@@ -154,6 +154,28 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 			tlabel = "server in";
 		}
 		level = "initial";
+	} else if (type == QUIC_PKT_0RTT) {
+		i_srt = qs->crypt.es_secret;
+		hash = qs->crypt.hash1;
+
+		tx_key = qs->crypt.l1_tx_key;
+		tx_iv = qs->crypt.l1_tx_iv;
+		tx_hp_key = qs->crypt.l1_tx_hp_key;
+
+		rx_key = qs->crypt.l1_rx_key;
+		rx_iv = qs->crypt.l1_rx_iv;
+		rx_hp_key = qs->crypt.l1_rx_hp_key;
+
+		t_srt = tx_srt;
+		r_srt = rx_srt;
+		if (qs->state < QUIC_CS_CLOSING) {
+			tlabel = "c e traffic";
+			rlabel = "s e traffic";
+		} else {
+			rlabel = "c e traffic";
+			tlabel = "s e traffic";
+		}
+		level = "0-rtt";
 	} else if (type == QUIC_PKT_HANDSHAKE) {
 		i_srt = qs->crypt.hs_secret;
 		hash = qs->crypt.hash2;
@@ -203,7 +225,7 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 	}
 
 	llen = strlen(tlabel);
-	err = quic_crypto_hkdf_expand(qs, i_srt, tlabel, llen, hash, t_srt, QUIC_HKDF_HASHLEN);
+	err = quic_crypto_hkdf_expand(qs, i_srt, tlabel, llen, hash, 32, t_srt, QUIC_HKDF_HASHLEN);
 	if (err)
 		return err;
 	pr_debug("%s tx secret: %32phN\n", level, t_srt);
@@ -214,7 +236,7 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 	pr_debug("%s tx_hp_key: %16phN\n", level, tx_hp_key);
 
 	llen = strlen(rlabel);
-	err = quic_crypto_hkdf_expand(qs, i_srt, rlabel, llen, hash, r_srt, QUIC_HKDF_HASHLEN);
+	err = quic_crypto_hkdf_expand(qs, i_srt, rlabel, llen, hash, 32, r_srt, QUIC_HKDF_HASHLEN);
 	if (err)
 		return err;
 	pr_debug("%s rx secret: %32phN\n", level, r_srt);
@@ -830,7 +852,7 @@ int quic_crypto_server_finished_create(struct quic_sock *qs, u8 *sf)
 	int err, llen;
 
 	llen = sizeof(KEY_LABEL) - 1;
-	err = quic_crypto_hkdf_expand(qs, qs->crypt.sh_secret, KEY_LABEL, llen, NULL,
+	err = quic_crypto_hkdf_expand(qs, qs->crypt.sh_secret, KEY_LABEL, llen, NULL, 0,
 				      fks, QUIC_HKDF_HASHLEN);
 	if (err)
 		return err;
@@ -867,6 +889,72 @@ int quic_crypto_server_finished_verify(struct quic_sock *qs)
 }
 
 /* exported */
+int quic_crypto_rms_key_install(struct quic_sock *qs)
+{
+	u8 RMS_LABEL[] = "res master";
+	int err, llen;
+
+	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CFIN + 1, qs->crypt.hash4);
+	if (err)
+		return err;
+	pr_debug("hash4: %32phN\n", qs->crypt.hash4);
+
+	llen = sizeof(RMS_LABEL) - 1;
+	err = quic_crypto_hkdf_expand(qs, qs->crypt.ms_secret, RMS_LABEL, llen, qs->crypt.hash4, 32,
+				      qs->crypt.rms_secret, QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+	pr_debug("rms_secret: %32phN\n", qs->crypt.rms_secret);
+
+	return 0;
+}
+
+/* exported */
+int quic_crypto_client_finished_verify(struct quic_sock *qs)
+{
+	u8 cf[QUIC_HKDF_HASHLEN];
+	int err;
+
+	err = quic_crypto_client_finished_create(qs, cf);
+	if (err)
+		return err;
+
+	err = (qs->crypt.hs_buf[QUIC_H_CFIN].len - 4 != QUIC_HKDF_HASHLEN ||
+	       memcmp(cf, qs->crypt.hs_buf[QUIC_H_CFIN].v + 4, QUIC_HKDF_HASHLEN));
+	if (err)
+		return err;
+	err = quic_crypto_rms_key_install(qs);
+	if (err)
+		return err;
+	pr_debug("client finished verified %d\n", err);
+	return 0;
+}
+
+/* exported */
+int quic_crypto_client_finished_create(struct quic_sock *qs, u8 *cf)
+{
+	u8 KEY_LABEL[] = "finished";
+	u8 fkc[QUIC_HKDF_HASHLEN];
+	int err, llen;
+
+	llen = sizeof(KEY_LABEL) - 1;
+	err = quic_crypto_hkdf_expand(qs, qs->crypt.ch_secret, KEY_LABEL, llen, NULL, 0,
+				      fkc, QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+	pr_debug("fkc: %32phN\n", fkc);
+
+	memcpy(qs->crypt.hash9, qs->crypt.hash3, QUIC_HKDF_HASHLEN);
+	err = quic_crypto_hkdf_extract(qs, fkc, QUIC_HKDF_HASHLEN, qs->crypt.hash9,
+				       QUIC_HKDF_HASHLEN, cf);
+	if (err)
+		return err;
+	pr_debug("CF: %32phN\n", cf);
+
+	return 0;
+}
+
+/* exported */
 int quic_crypto_encrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 {
 	u8 *key, *iv, *hp_key;
@@ -876,6 +964,10 @@ int quic_crypto_encrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 		key = qs->crypt.tx_key;
 		iv = qs->crypt.tx_iv;
 		hp_key = qs->crypt.tx_hp_key;
+	} else if (type == QUIC_PKT_0RTT) {
+		key = qs->crypt.l1_tx_key;
+		iv = qs->crypt.l1_tx_iv;
+		hp_key = qs->crypt.l1_tx_hp_key;
 	} else if (type == QUIC_PKT_HANDSHAKE) {
 		key = qs->crypt.l2_tx_key;
 		iv = qs->crypt.l2_tx_iv;
@@ -903,6 +995,10 @@ int quic_crypto_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 		key = qs->crypt.rx_key;
 		iv = qs->crypt.rx_iv;
 		hp_key = qs->crypt.rx_hp_key;
+	} else if (type == QUIC_PKT_0RTT) {
+		key = qs->crypt.l1_rx_key;
+		iv = qs->crypt.l1_rx_iv;
+		hp_key = qs->crypt.l1_rx_hp_key;
 	} else if (type == QUIC_PKT_HANDSHAKE) {
 		key = qs->crypt.l2_rx_key;
 		iv = qs->crypt.l2_rx_iv;
@@ -929,9 +1025,9 @@ int quic_crypto_initial_keys_install(struct quic_sock *qs)
 {
 	static u8 salt[] =
 	  "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a";
+	u8 *dcid, dcid_len, zeros[QUIC_HKDF_HASHLEN] = {0};
 	int salt_len = sizeof(salt) - 1;
 	struct quic_cid *cid;
-	u8 *dcid, dcid_len;
 	int err;
 
 	err = quic_crypto_generate_ecdh_keys(qs);
@@ -948,20 +1044,113 @@ int quic_crypto_initial_keys_install(struct quic_sock *qs)
 	}
 
 	err = quic_crypto_hkdf_extract(qs, salt, salt_len, dcid,
-				       dcid_len, qs->crypt.es_secret);
+				       dcid_len, qs->crypt.init_secret);
 	if (err)
 		return err;
-	pr_debug("es secret: %32phN\n", qs->crypt.es_secret);
+	pr_debug("init_secret: %32phN\n", qs->crypt.init_secret);
+
+	err = quic_crypto_hkdf_extract(qs, zeros, 0, zeros,
+				       QUIC_HKDF_HASHLEN, qs->crypt.es_secret);
+	if (err)
+		return err;
+	pr_debug("es_secret: %32phN\n", qs->crypt.es_secret);
 
 	return quic_crypto_keys_create(qs, QUIC_PKT_INITIAL);
 }
 
 /* exported */
+int quic_crypto_early_binder_create(struct quic_sock *qs, u8 *v, u32 len)
+{
+	struct quic_vlen vlen;
+	int err;
+
+	vlen.v = v;
+	vlen.len = len;
+	err = quic_crypto_hash(qs, &vlen, 1, qs->crypt.hash5);
+	if (err)
+		return err;
+	pr_debug("hash5: %32phN\n", qs->crypt.hash5);
+
+	err = quic_crypto_hkdf_extract(qs, qs->crypt.fbk_secret, QUIC_HKDF_HASHLEN, qs->crypt.hash5,
+				       QUIC_HKDF_HASHLEN, qs->crypt.binder_secret);
+	if (err)
+		return err;
+	pr_debug("binder: %32phN\n", qs->crypt.binder_secret);
+	return 0;
+}
+
+/* exported */
+int quic_crypto_early_keys_prepare(struct quic_sock *qs)
+{
+	u8 zeros[QUIC_HKDF_HASHLEN] = {0}, *nonce, *mskey;
+	u8 bk_secret[QUIC_HKDF_HASHLEN];
+	u8 PSK_LABEL[] = "resumption";
+	u8 BK_LABEL[] = "res binder";
+	u8 FBK_LABEL[] = "finished";
+	u8 psk[QUIC_HKDF_HASHLEN];
+	int err, llen, len;
+
+	if (!qs->crypt.psks)
+		return 0;
+
+	nonce = qs->crypt.psks->nonce.v;
+	mskey = qs->crypt.psks->mskey.v;
+	len = qs->crypt.psks->nonce.len;
+
+	llen = sizeof(PSK_LABEL) - 1;
+	err = quic_crypto_hkdf_expand(qs, mskey, PSK_LABEL, llen, nonce, len, psk,
+				      QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+	pr_debug("psk: %32phN\n", psk);
+
+	err = quic_crypto_hash(qs, NULL, 0, qs->crypt.hash0);
+	if (err)
+		return err;
+	pr_debug("hash0: %32phN\n", qs->crypt.hash0);
+
+	err = quic_crypto_hkdf_extract(qs, zeros, 0, psk,
+				       QUIC_HKDF_HASHLEN, qs->crypt.es_secret);
+	if (err)
+		return err;
+	pr_debug("es_secret: %32phN\n", qs->crypt.es_secret);
+
+	llen = sizeof(BK_LABEL) - 1;
+	err = quic_crypto_hkdf_expand(qs, qs->crypt.es_secret, BK_LABEL, llen, qs->crypt.hash0, 32,
+				      bk_secret, QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+	pr_debug("bk_secret: %32phN\n", bk_secret);
+
+	llen = sizeof(FBK_LABEL) - 1;
+	err = quic_crypto_hkdf_expand(qs, bk_secret, FBK_LABEL, llen, NULL, 0,
+				      qs->crypt.fbk_secret, QUIC_HKDF_HASHLEN);
+	if (err)
+		return err;
+	pr_debug("fbk_secret: %32phN\n", qs->crypt.fbk_secret);
+	return 0;
+}
+
+/* exported */
+int quic_crypto_early_keys_install(struct quic_sock *qs)
+{
+	int err;
+
+	if (!qs->crypt.psks)
+		return 0;
+
+	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CH + 1, qs->crypt.hash1);
+	if (err)
+		return err;
+	pr_debug("hash1: %32phN\n", qs->crypt.hash1);
+
+	return quic_crypto_keys_create(qs, QUIC_PKT_0RTT);
+}
+
+/* exported */
 int quic_crypto_handshake_keys_install(struct quic_sock *qs)
 {
-	u8 zeros[QUIC_HKDF_HASHLEN] = {0};
 	u8 des_secret[QUIC_HKDF_HASHLEN];
-	u8 es_secret[QUIC_HKDF_HASHLEN];
 	u8 KEY_LABEL[] = "derived";
 	int err, llen;
 
@@ -970,15 +1159,9 @@ int quic_crypto_handshake_keys_install(struct quic_sock *qs)
 		return err;
 	pr_debug("hash0: %32phN\n", qs->crypt.hash0);
 
-	err = quic_crypto_hkdf_extract(qs, zeros, 0, zeros,
-				       QUIC_HKDF_HASHLEN, es_secret);
-	if (err)
-		return err;
-	pr_debug("es_secret: %32phN\n", es_secret);
-
 	llen = sizeof(KEY_LABEL) - 1;
-	err = quic_crypto_hkdf_expand(qs, es_secret, KEY_LABEL, llen, qs->crypt.hash0,
-				      des_secret, QUIC_HKDF_HASHLEN);
+	err = quic_crypto_hkdf_expand(qs, qs->crypt.es_secret, KEY_LABEL, llen,
+				      qs->crypt.hash0, 32, des_secret, QUIC_HKDF_HASHLEN);
 	if (err)
 		return err;
 	pr_debug("des_secret: %32phN\n", des_secret);
@@ -1002,10 +1185,7 @@ int quic_crypto_application_keys_install(struct quic_sock *qs)
 {
 	u8 zeros[QUIC_HKDF_HASHLEN] = {0};
 	u8 dhs_secret[QUIC_HKDF_HASHLEN];
-	u8 FIN_KEY_LABEL[] = "finished";
 	u8 KEY_LABEL[] = "derived";
-	u8 fkc[QUIC_HKDF_HASHLEN];
-	u8 cf[QUIC_HKDF_HASHLEN];
 	int err, llen;
 
 	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_SFIN + 1, qs->crypt.hash3);
@@ -1014,7 +1194,7 @@ int quic_crypto_application_keys_install(struct quic_sock *qs)
 	pr_debug("hash3: %32phN\n", qs->crypt.hash3);
 
 	llen = sizeof(KEY_LABEL) - 1;
-	err = quic_crypto_hkdf_expand(qs, qs->crypt.hs_secret, KEY_LABEL, llen, qs->crypt.hash0,
+	err = quic_crypto_hkdf_expand(qs, qs->crypt.hs_secret, KEY_LABEL, llen, qs->crypt.hash0, 32,
 				      dhs_secret, QUIC_HKDF_HASHLEN);
 	if (err)
 		return err;
@@ -1029,24 +1209,6 @@ int quic_crypto_application_keys_install(struct quic_sock *qs)
 	err = quic_crypto_keys_create(qs, QUIC_PKT_SHORT);
 	if (err)
 		return err;
-
-	llen = sizeof(FIN_KEY_LABEL) - 1;
-	err = quic_crypto_hkdf_expand(qs, qs->crypt.ch_secret, FIN_KEY_LABEL, llen, NULL,
-				      fkc, QUIC_HKDF_HASHLEN);
-	if (err)
-		return err;
-	pr_debug("fkc: %32phN\n", fkc);
-
-	memcpy(qs->crypt.hash9, qs->crypt.hash3, QUIC_HKDF_HASHLEN);
-	err = quic_crypto_hkdf_extract(qs, fkc, QUIC_HKDF_HASHLEN, qs->crypt.hash9,
-				       QUIC_HKDF_HASHLEN, cf);
-	if (err)
-		return err;
-	qs->crypt.hs_buf[QUIC_H_CFIN].len = QUIC_HKDF_HASHLEN;
-	qs->crypt.hs_buf[QUIC_H_CFIN].v = quic_mem_dup(cf, qs->crypt.hs_buf[QUIC_H_CFIN].len);
-	if (!qs->crypt.hs_buf[QUIC_H_CFIN].v)
-		return -ENOMEM;
-	pr_debug("CF: %32phN\n", qs->crypt.hs_buf[QUIC_H_CFIN].v);
 
 	return 0;
 }
@@ -1100,6 +1262,60 @@ int quic_crypto_init(struct quic_sock *qs)
 err:
 	quic_crypto_free(qs);
 	return err;
+}
+
+int quic_crypto_psk_create(struct quic_sock *qs, u8 *pskid, u32 pskid_len,
+			   u8 *nonce, u32 nonce_len, u8 *mskey, u32 mskey_len)
+{
+	struct quic_psk *psk;
+
+	nonce = quic_mem_dup(nonce, nonce_len);
+	if (!nonce)
+		return -ENOMEM;
+
+	pskid = quic_mem_dup(pskid, pskid_len);
+	if (!pskid) {
+		kfree(nonce);
+		return -ENOMEM;
+	}
+
+	mskey = quic_mem_dup(mskey, mskey_len);
+	if (!mskey) {
+		kfree(nonce);
+		kfree(pskid);
+		return -ENOMEM;
+	}
+
+	psk = kzalloc(sizeof(*psk), GFP_ATOMIC);
+	if (!psk) {
+		kfree(nonce);
+		kfree(pskid);
+		kfree(mskey);
+		return -ENOMEM;
+	}
+	psk->pskid.v = pskid;
+	psk->pskid.len = pskid_len;
+	psk->nonce.v = nonce;
+	psk->nonce.len = nonce_len;
+	psk->mskey.v = mskey;
+	psk->mskey.len = mskey_len;
+	psk->psk_expire = 5000;
+
+	qs->crypt.psks = psk;
+	return 0;
+}
+
+void quic_crypto_psk_free(struct quic_sock *qs)
+{
+	struct quic_psk *psk = qs->crypt.psks;
+
+	for (; psk; psk = psk->next) {
+		kfree(psk->pskid.v);
+		kfree(psk->nonce.v);
+		kfree(psk->mskey.v);
+	}
+	kfree(qs->crypt.psks);
+	qs->crypt.psks = NULL;
 }
 
 /* exported */
@@ -1171,6 +1387,7 @@ void quic_crypt_free(struct quic_sock *qs)
 	kfree(qs->crypt.crt.v);
 	kfree(qs->crypt.hello.cipher_suites);
 	kfree(qs->crypt.hello.compression_methods);
+	quic_crypto_psk_free(qs);
 
 	for (i = 0; i < QUIC_H_COUNT; i++)
 		kfree(qs->crypt.hs_buf[i].v);

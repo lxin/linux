@@ -14,7 +14,7 @@
 
 static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 {
-	int len, hlen, plen, rlen, padlen = 0, dlen, minlen = 16;
+	int len, hlen, plen, rlen, padlen = 0, dlen, minlen = 16, early_len = 0;
 	struct quic_vlen *f = qs->packet.f;
 	struct quic_lhdr *hdr;
 	struct sk_buff *skb;
@@ -24,10 +24,15 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 	len = sizeof(*hdr) + 4 + 2 + qs->cids.dcid.cur->len + qs->cids.scid.cur->len;
 
 	if (type == QUIC_PKT_INITIAL) {
+		if (qs->frame.stream.msg)
+			early_len = len + 1 + 1 + iov_iter_count(qs->frame.stream.msg);
 		len += quic_put_varint_len(qs->token.len) + qs->token.len;
 		qs->packet.pn = qs->packet.in_tx_pn++;
 		if (!qs->packet.pn)
-			minlen = 1178;
+			minlen = (early_len >= 1178) ? 0 : (1178 - early_len);
+	} else if (type == QUIC_PKT_0RTT) {
+		qs->packet.pn = qs->packet.ad_tx_pn++;
+		minlen = 0;
 	} else {
 		qs->packet.pn = qs->packet.hs_tx_pn++;
 	}
@@ -279,7 +284,7 @@ int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb)
 		f = &qs->frame.f[i];
 		if (!f->len)
 			continue;
-		type = (i == QUIC_FR_NR - 1) ? QUIC_PKT_HANDSHAKE : (i * 2);
+		type = (i == QUIC_FR_NR - 1) ? QUIC_PKT_HANDSHAKE : i;
 		qs->packet.f = f;
 		skb = quic_packet_do_create(qs, type);
 		if (!skb)
@@ -302,10 +307,11 @@ struct sk_buff *quic_packet_create(struct quic_sock *qs, u8 type, u8 ftype)
 	int err;
 
 	qs->packet.type = type;
+	qs->frame.has_strm = 0;
 	err = quic_frame_create(qs, ftype);
 	if (err)
 		return NULL;
-	qs->packet.f = &qs->frame.f[type / 2];
+	qs->packet.f = &qs->frame.f[type];
 	skb = quic_packet_do_create(qs, type);
 	if (!skb)
 		return NULL;

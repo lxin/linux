@@ -122,6 +122,10 @@ static void quic_ping_timeout(struct timer_list *t)
 		goto out;
 	}
 
+	if (qs->state != QUIC_CS_CLIENT_POST_HANDSHAKE &&
+	    qs->state != QUIC_CS_SERVER_POST_HANDSHAKE)
+		goto out;
+
 	if (qs->packet.ping_cnt++ > 3) {
 		sk->sk_err = -ETIMEDOUT;
 		pr_warn("ping timeout %d\n", sk->sk_err);
@@ -130,7 +134,7 @@ static void quic_ping_timeout(struct timer_list *t)
 	}
 
 	quic_start_ping_timer(qs, 0);
-	qs->packet.f = &qs->frame.f[QUIC_PKT_SHORT / 2];
+	qs->packet.f = &qs->frame.f[QUIC_PKT_SHORT];
 	skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_PING);
 	if (!skb)
 		goto out;
@@ -183,18 +187,22 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 	memcpy(quic_saddr_cur(nqs), quic_saddr_cur(qs), qs->af->addr_len);
 	nqs->path.src.usk[0] = quic_us_get(qs->path.src.usk[0]);
 	nqs->path.src.usk[1] = quic_us_get(qs->path.src.usk[1]);
-	nqs->crypt.crt.len = qs->crypt.crt.len;
-	nqs->crypt.crt.v = quic_mem_dup(qs->crypt.crt.v, nqs->crypt.crt.len);
-	if (!nqs->crypt.crt.v)
-		return -ENOMEM;
-	x = x509_cert_parse(qs->crypt.crt.v, nqs->crypt.crt.len);
-	if (IS_ERR(x))
-		return PTR_ERR(x);
-	nqs->crypt.cert = x;
-	nqs->crypt.pkey.v = quic_mem_dup(qs->crypt.pkey.v, qs->crypt.pkey.len);
-	if (!nqs->crypt.pkey.v)
-		return -ENOMEM;
-	nqs->crypt.pkey.len = qs->crypt.pkey.len;
+	if (qs->crypt.crt.len) {
+		nqs->crypt.crt.len = qs->crypt.crt.len;
+		nqs->crypt.crt.v = quic_mem_dup(qs->crypt.crt.v, nqs->crypt.crt.len);
+		if (!nqs->crypt.crt.v)
+			return -ENOMEM;
+		x = x509_cert_parse(qs->crypt.crt.v, nqs->crypt.crt.len);
+		if (IS_ERR(x))
+			return PTR_ERR(x);
+		nqs->crypt.cert = x;
+	}
+	if (qs->crypt.pkey.len) {
+		nqs->crypt.pkey.v = quic_mem_dup(qs->crypt.pkey.v, qs->crypt.pkey.len);
+		if (!nqs->crypt.pkey.v)
+			return -ENOMEM;
+		nqs->crypt.pkey.len = qs->crypt.pkey.len;
+	}
 	return 0;
 }
 
