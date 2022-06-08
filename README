@@ -76,6 +76,19 @@ How to Use It
     # sh server_early.sh
     # sh client_early.sh
 
+  or for certificate chain example test by:
+
+    # cd tools/testing/selftests/net/quic/
+    # sh server_certs.sh
+    # sh client_certs.sh
+    (new cert chian and ca files can be create by gen_certs.sh)
+
+  or for key update example test by:
+
+    # cd tools/testing/selftests/net/quic/
+    # sh server_keys.sh
+    # sh client_keys.sh
+
   and it can also interact with ngtcp2, after building ngtcp2:
 
     # cd ngtcp2/examples/
@@ -96,11 +109,11 @@ TODO
   - Protocol:
     * Add ICMP(v6) TooBig/FragNeeded Prcess and PLPMTUD.
     * Add more socket options and send/recv parameters.
+    * Retry and Version Negotiation.
 
   - Handshake:
     * Adjust code to support more crypto algorithms.
     * Process more TLS 1.3 messages and extensions.
-    * Add Key Update and HelloRetryRequest.
 
   - Congestion Control:
     * https://datatracker.ietf.org/doc/html/rfc9002

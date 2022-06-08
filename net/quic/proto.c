@@ -923,23 +923,132 @@ int quic_inet_getname(struct socket *sock, struct sockaddr *uaddr, int peer)
 	return quic_sk(sock->sk)->af->get_name(sock, uaddr, peer);
 }
 
-static int quic_setsockopt_cert(struct sock *sk, u8 *cert, unsigned int len)
+struct quic_cert *quic_cert_create(struct x509_certificate *x, u8 *cert, int len)
+{
+	struct quic_cert *c;
+
+	c = kzalloc(sizeof(*c), GFP_ATOMIC);
+	if (!c)
+		return NULL;
+
+	c->cert = x;
+	c->raw.len = len;
+	c->raw.v = quic_mem_dup(cert, len);
+	if (!c->raw.v) {
+		kfree(c);
+		return NULL;
+	}
+
+	return c;
+}
+
+void quic_cert_free(struct quic_cert *cert)
+{
+	struct quic_cert *c, *p = cert;
+
+	while (p) {
+		c = p->next;
+		kfree(p->cert);
+		kfree(p->raw.v);
+		kfree(p);
+		p = c;
+	}
+}
+
+static int quic_setsockopt_root_ca(struct sock *sk, u8 *cert, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
 	struct x509_certificate *x;
+	struct quic_cert *c;
+
+	if (!len) {
+		quic_cert_free(qs->crypt.ca);
+		qs->crypt.ca = NULL;
+		return 0;
+	}
 
 	x = x509_cert_parse(cert, len);
 	if (IS_ERR(x))
 		return PTR_ERR(x);
 
-	qs->crypt.crt.len = len;
-	qs->crypt.crt.v = quic_mem_dup(cert, qs->crypt.crt.len);
-	if (!qs->crypt.crt.v) {
+	c = quic_cert_create(x, cert, len);
+	if (!c) {
 		kfree(x);
 		return -ENOMEM;
 	}
 
-	qs->crypt.cert = x;
+	qs->crypt.ca = c;
+	return 0;
+}
+
+static int quic_setsockopt_cert(struct sock *sk, u8 *cert, unsigned int len)
+{
+	struct quic_sock *qs = quic_sk(sk);
+	struct x509_certificate *x;
+	struct quic_cert *c, *p;
+
+	if (!len) {
+		quic_cert_free(qs->crypt.certs);
+		qs->crypt.certs = NULL;
+		return 0;
+	}
+
+	x = x509_cert_parse(cert, len);
+	if (IS_ERR(x))
+		return PTR_ERR(x);
+
+	c = quic_cert_create(x, cert, len);
+	if (!c) {
+		kfree(x);
+		return -ENOMEM;
+	}
+
+	p = qs->crypt.certs;
+	if (p) {
+		for (; p->next; p = p->next)
+			;
+		p->next = c;
+	} else {
+		qs->crypt.certs = c;
+	}
+
+	return 0;
+}
+
+static int quic_setsockopt_cert_chain(struct sock *sk, u8 *cert, unsigned int len)
+{
+	struct quic_cert *c, *certs = NULL, *p = NULL;
+	struct quic_sock *qs = quic_sk(sk);
+	struct x509_certificate *x;
+	int clen;
+
+	while (len > 0) {
+		clen = *((u32 *)cert);
+		cert += 4;
+		len -= 4;
+		x = x509_cert_parse(cert, clen);
+		if (IS_ERR(x)) {
+			quic_cert_free(p);
+			return PTR_ERR(x);
+		}
+
+		c = quic_cert_create(x, cert, clen);
+		if (!c) {
+			kfree(x);
+			quic_cert_free(p);
+			return -ENOMEM;
+		}
+		cert += clen;
+		len -= clen;
+		if (!certs)
+			certs = c;
+		else
+			p->next = c;
+		p = c;
+	}
+
+	quic_cert_free(qs->crypt.certs);
+	qs->crypt.certs = certs;
 
 	return 0;
 }
@@ -1183,6 +1292,24 @@ static int quic_setsockopt_load_ticket(struct sock *sk, u8 *psk, unsigned int le
 	return 0;
 }
 
+static int quic_setsockopt_key_update(struct sock *sk, u8 *key, unsigned int len)
+{
+	struct quic_sock *qs = quic_sk(sk);
+	int err;
+
+	if (qs->crypt.key_pending ||
+	    (qs->state != QUIC_CS_SERVER_POST_HANDSHAKE &&
+	     qs->state != QUIC_CS_CLIENT_POST_HANDSHAKE))
+		return -EINVAL;
+
+	err = quic_crypto_key_update(qs);
+	if (err)
+		return err;
+
+	qs->crypt.key_pending = 1;
+	return 0;
+}
+
 static int quic_setsockopt_new_cid(struct sock *sk, u32 *cid, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
@@ -1304,7 +1431,8 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 	}
 
 	listen = sk->sk_state == QUIC_SS_LISTENING;
-	if ((optname == QUIC_SOCKOPT_CERT || optname == QUIC_SOCKOPT_PKEY) ^ listen) {
+	if ((optname == QUIC_SOCKOPT_CERT || optname == QUIC_SOCKOPT_CERT_CHAIN ||
+	     optname == QUIC_SOCKOPT_PKEY) ^ listen) {
 		retval = -EINVAL;
 		goto out;
 	}
@@ -1312,6 +1440,12 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 	switch (optname) {
 	case QUIC_SOCKOPT_CERT:
 		retval = quic_setsockopt_cert(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CERT_CHAIN:
+		retval = quic_setsockopt_cert_chain(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_ROOT_CA:
+		retval = quic_setsockopt_root_ca(sk, kopt, optlen);
 		break;
 	case QUIC_SOCKOPT_PKEY:
 		retval = quic_setsockopt_pkey(sk, kopt, optlen);
@@ -1352,6 +1486,9 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 	case QUIC_SOCKOPT_LOAD_TICKET:
 		retval = quic_setsockopt_load_ticket(sk, kopt, optlen);
 		break;
+	case QUIC_SOCKOPT_KEY_UPDATE:
+		retval = quic_setsockopt_key_update(sk, kopt, optlen);
+		break;
 	default:
 		retval = -ENOPROTOOPT;
 		break;
@@ -1366,17 +1503,58 @@ static int quic_getsockopt_cert(struct sock *sk, int len, char __user *optval,
 				int __user *optlen)
 {
 	struct quic_sock *qs = quic_sk(sk);
+	struct quic_cert *c;
 
-	if (len < qs->crypt.crt.len)
+	c = qs->crypt.certs;
+	if (len < c->raw.len)
 		return -EINVAL;
 
-	len = qs->crypt.crt.len;
+	len = c->raw.len;
 	if (put_user(len, optlen))
 		return -EFAULT;
 
-	if (len && copy_to_user(optval, qs->crypt.crt.v, len))
+	if (len && copy_to_user(optval, c->raw.v, len))
 		return -EFAULT;
 
+	return 0;
+}
+
+static int quic_getsockopt_cert_chain(struct sock *sk, int len, char __user *optval,
+				      int __user *optlen)
+{
+	struct quic_sock *qs = quic_sk(sk);
+	struct quic_cert *c;
+	int clen = 0;
+	u8 *p, *tmp;
+
+	for (c = qs->crypt.certs; c; c = c->next)
+		clen += (4 + c->raw.len);
+
+	if (len < clen)
+		return -EINVAL;
+
+	tmp = kzalloc(clen, GFP_KERNEL);
+	if (!tmp)
+		return -EINVAL;
+	p = tmp;
+	for (c = qs->crypt.certs; c; c = c->next) {
+		*((u32 *)p) = c->raw.len;
+		p += 4;
+		memcpy(p, c->raw.v, c->raw.len);
+		p += c->raw.len;
+	}
+	len = clen;
+	if (put_user(len, optlen)) {
+		kfree(tmp);
+		return -EFAULT;
+	}
+
+	if (len && copy_to_user(optval, tmp, len)) {
+		kfree(tmp);
+		return -EFAULT;
+	}
+
+	kfree(tmp);
 	return 0;
 }
 
@@ -1594,6 +1772,9 @@ static int quic_getsockopt(struct sock *sk, int level, int optname,
 	switch (optname) {
 	case QUIC_SOCKOPT_CERT:
 		retval = quic_getsockopt_cert(sk, len, optval, optlen);
+		break;
+	case QUIC_SOCKOPT_CERT_CHAIN:
+		retval = quic_getsockopt_cert_chain(sk, len, optval, optlen);
 		break;
 	case QUIC_SOCKOPT_PKEY:
 		retval = quic_getsockopt_pkey(sk, len, optval, optlen);

@@ -226,7 +226,7 @@ enum quic_pkt_type {
 	QUIC_PKT_SHORT = 0x4
 };
 
-#define QUIC_FR_NR	(QUIC_PKT_SHORT + 1 + 1)
+#define QUIC_FR_NR	(QUIC_PKT_SHORT + 1 + 2)
 
 struct quic_psk {
 	struct quic_psk *next;
@@ -235,6 +235,12 @@ struct quic_psk {
 	struct quic_vlen pskid;
 	struct quic_vlen nonce;
 	struct quic_vlen mskey;
+};
+
+struct quic_cert {
+	struct quic_cert *next;
+	struct x509_certificate *cert;
+	struct quic_vlen raw;
 };
 
 struct quic_crypt {
@@ -248,8 +254,8 @@ struct quic_crypt {
 	u8 rms_secret[QUIC_HKDF_HASHLEN];
 	u8 fbk_secret[QUIC_HKDF_HASHLEN];
 	u8 dhe_secret[QUIC_HKDF_HASHLEN];
-	u8 capp_secret[QUIC_HKDF_HASHLEN];
-	u8 sapp_secret[QUIC_HKDF_HASHLEN];
+	u8 tapp_secret[QUIC_HKDF_HASHLEN];
+	u8 rapp_secret[QUIC_HKDF_HASHLEN];
 	u8 binder_secret[QUIC_HKDF_HASHLEN];
 
 	struct crypto_shash *hash_tfm;
@@ -280,10 +286,10 @@ struct quic_crypt {
 	u8 l2_tx_iv[QUIC_IVLEN];
 	u8 l2_rx_key[QUIC_KEYLEN];
 	u8 l2_rx_iv[QUIC_IVLEN];
-	u8 l3_tx_key[QUIC_KEYLEN];
-	u8 l3_tx_iv[QUIC_IVLEN];
-	u8 l3_rx_key[QUIC_KEYLEN];
-	u8 l3_rx_iv[QUIC_IVLEN];
+	u8 l3_tx_key[2][QUIC_KEYLEN];
+	u8 l3_tx_iv[2][QUIC_IVLEN];
+	u8 l3_rx_key[2][QUIC_KEYLEN];
+	u8 l3_rx_iv[2][QUIC_IVLEN];
 
 	struct crypto_skcipher *skc_tfm;
 	u8 tx_hp_key[QUIC_KEYLEN];
@@ -299,12 +305,14 @@ struct quic_crypt {
 	struct quic_vlen hs_buf[QUIC_H_COUNT];
 
 	struct crypto_akcipher *akc_tfm;
-	struct x509_certificate *cert;
+	struct quic_cert *certs;
+	struct quic_cert *ca;
 	struct quic_vlen pkey;
 	struct quic_vlen sig;
-	struct quic_vlen crt;
 
 	struct quic_psk *psks;
+	u8 key_phase:1,
+	   key_pending:1;
 };
 
 struct quic_frame {
@@ -346,6 +354,7 @@ struct quic_packet {
 	struct sk_buff *fc_md;
 	struct sk_buff *fc_msd;
 	struct sk_buff *ticket;
+	struct sk_buff *ku;
 	u32 in_tx_pn;
 	u32 hs_tx_pn;
 	u32 ad_tx_pn;
@@ -356,7 +365,8 @@ struct quic_packet {
 	u8 pn_len;
 	u8 pn_off;
 	u8 type;
-	u8 cork;
+	u8 cork:1,
+	   key_phase:1;
 
 	u64 snd_len;
 	u64 rcv_len;
@@ -926,6 +936,8 @@ static inline union quic_addr *quic_daddr_cur(struct quic_sock *qs)
 /* proto.c */
 struct quic_af *quic_af_get(sa_family_t family);
 int quic_dst_mss_check(struct quic_sock *qs, int hdr);
+void quic_cert_free(struct quic_cert *cert);
+struct quic_cert *quic_cert_create(struct x509_certificate *x, u8 *cert, int len);
 
 /* udp.c */
 struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs, union quic_addr *a);
@@ -989,6 +1001,7 @@ int quic_crypto_client_finished_verify(struct quic_sock *qs);
 int quic_crypto_psk_create(struct quic_sock *qs, u8 *pskid, u32 pskid_len,
 			   u8 *nonce, u32 nonce_len, u8 *mskey, u32 mskey_len);
 void quic_crypto_psk_free(struct quic_sock *qs);
+int quic_crypto_key_update(struct quic_sock *qs);
 
 /* input.c */
 int quic_rcv(struct sk_buff *skb);

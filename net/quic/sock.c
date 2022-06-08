@@ -152,7 +152,6 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 	struct sock *sk = &qs->inet.sk;
 	struct inet_sock *ninet = inet_sk(nsk);
 	struct inet_sock *inet = inet_sk(sk);
-	struct x509_certificate *x;
 
 	nsk->sk_type = sk->sk_type;
 	nsk->sk_bound_dev_if = sk->sk_bound_dev_if;
@@ -187,15 +186,22 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 	memcpy(quic_saddr_cur(nqs), quic_saddr_cur(qs), qs->af->addr_len);
 	nqs->path.src.usk[0] = quic_us_get(qs->path.src.usk[0]);
 	nqs->path.src.usk[1] = quic_us_get(qs->path.src.usk[1]);
-	if (qs->crypt.crt.len) {
-		nqs->crypt.crt.len = qs->crypt.crt.len;
-		nqs->crypt.crt.v = quic_mem_dup(qs->crypt.crt.v, nqs->crypt.crt.len);
-		if (!nqs->crypt.crt.v)
-			return -ENOMEM;
-		x = x509_cert_parse(qs->crypt.crt.v, nqs->crypt.crt.len);
-		if (IS_ERR(x))
-			return PTR_ERR(x);
-		nqs->crypt.cert = x;
+	if (qs->crypt.certs) {
+		struct quic_cert *c, *p, *tmp, *certs = NULL;
+
+		for (p = qs->crypt.certs; p; p = p->next) {
+			c = quic_cert_create(p->cert, p->raw.v, p->raw.len);
+			if (!c) {
+				nqs->crypt.certs = certs;
+				return -ENOMEM;
+			}
+			if (certs)
+				tmp->next = c;
+			else
+				certs = c;
+			tmp = c;
+		}
+		nqs->crypt.certs = certs;
 	}
 	if (qs->crypt.pkey.len) {
 		nqs->crypt.pkey.v = quic_mem_dup(qs->crypt.pkey.v, qs->crypt.pkey.len);

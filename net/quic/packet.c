@@ -133,7 +133,7 @@ static struct sk_buff *quic_packet_short_create(struct quic_sock *qs)
 	hdr->fixed = 1;
 	hdr->spin = 0;
 	hdr->reserved = 0;
-	hdr->key = 0;
+	hdr->key = qs->crypt.key_phase;
 	hdr->pnl = plen;
 	p = (u8 *)hdr;
 	p++;
@@ -284,7 +284,7 @@ int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb)
 		f = &qs->frame.f[i];
 		if (!f->len)
 			continue;
-		type = (i == QUIC_FR_NR - 1) ? QUIC_PKT_HANDSHAKE : i;
+		type = (i >= QUIC_PKT_SHORT + 1) ? QUIC_PKT_HANDSHAKE : i;
 		qs->packet.f = f;
 		skb = quic_packet_do_create(qs, type);
 		if (!skb)

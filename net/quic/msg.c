@@ -24,7 +24,8 @@ static int quic_msg_encrypted_extension_process(struct quic_sock *qs, u8 *p, u32
 
 static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 {
-	struct x509_certificate *x, *cert = NULL;
+	struct quic_cert *c, *certs = NULL, *tmp = NULL;
+	struct x509_certificate *x;
 	u8 *cert_p;
 	u32 clen;
 
@@ -44,12 +45,18 @@ static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 		x = x509_cert_parse(p, len);
 		if (IS_ERR(x))
 			return PTR_ERR(x);
-		if (!cert) {
-			cert = x;
-		} else {
-			x->next = cert;
-			cert = x;
+
+		c = quic_cert_create(x, p, len);
+		if (!c) {
+			kfree(x);
+			qs->crypt.certs = certs;
+			return -ENOMEM;
 		}
+		if (!certs)
+			certs = c;
+		else
+			tmp->next = c;
+		tmp = c;
 		p += len;
 
 		len = quic_get_fixint_next(&p, 2);
@@ -59,7 +66,7 @@ static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 		if ((u32)(p - cert_p) >= clen)
 			break;
 	}
-	qs->crypt.cert = cert;
+	qs->crypt.certs = certs;
 
 	return quic_crypto_server_cert_verify(qs);
 }
@@ -347,9 +354,11 @@ int quic_msg_process(struct quic_sock *qs, u8 *p, u32 hs_len, u32 hs_offset, u32
 			pr_err_once("crypto frame: unsupported msg %u\n", v);
 			return -EPROTONOSUPPORT;
 		}
-		quic_msgs[v].msg_process(qs, p, len);
-		if (err)
+		err = quic_msgs[v].msg_process(qs, p, len);
+		if (err) {
+			pr_err("crypto msg err %u %d\n", v, err);
 			return err;
+		}
 
 		p += len;
 		left -= len;

@@ -42,6 +42,7 @@ enum quic_evt_type {
 	QUIC_EVT_STREAMS,	/* RESET, STOP, MAX, BLOCKED */
 	QUIC_EVT_ADDRESS,	/* NEW */
 	QUIC_EVT_TICKET,	/* NEW */
+	QUIC_EVT_KEY,		/* NEW */
 	QUIC_EVT_MAX,
 };
 
@@ -64,6 +65,10 @@ enum quic_evt_addr_type {
 
 enum quic_evt_ticket_type {
 	QUIC_EVT_TICKET_NEW,
+};
+
+enum quic_evt_key_type {
+	QUIC_EVT_KEY_NEW,
 };
 
 struct quic_evt_msg {
@@ -101,6 +106,13 @@ struct quic_evt_msg {
 /* ticket */
 #define QUIC_SOCKOPT_NEW_TICKET		15
 #define QUIC_SOCKOPT_LOAD_TICKET	16
+
+/* key */
+#define QUIC_SOCKOPT_KEY_UPDATE		17
+
+/* certificate chain */
+#define QUIC_SOCKOPT_CERT_CHAIN		18
+#define QUIC_SOCKOPT_ROOT_CA		19
 
 #define MSG_NOTIFICATION		0x8000
 

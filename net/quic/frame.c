@@ -431,9 +431,10 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 {
 	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_HANDSHAKE];
 	struct quic_param *pm = &qs->params.local;
-	u32 f_len, m_len, p_len, clen, t_len;
+	u32 f_len, m_len, p_len, clen = 0, t_len;
+	u32 e_len, c_len, v_len, fin_len, i = 1;
 	u8 *p, *tmp, sf[QUIC_HKDF_HASHLEN];
-	u32 e_len, c_len, v_len, fin_len;
+	struct quic_cert *c;
 	int err, mss;
 
 	mss = quic_dst_mss_check(qs, 2);
@@ -446,8 +447,10 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	fin_len = 4 + QUIC_HKDF_HASHLEN;
 	t_len = e_len + fin_len;
 	if (!qs->crypt.psks) {
-		clen = qs->crypt.crt.len;
-		c_len = 4 + (2 + clen + 3) + 4;
+		for (c = qs->crypt.certs; c; c = c->next)
+			clen += (2 + c->raw.len + 3);
+
+		c_len = 4 + clen + 4;
 		v_len = 4 + (2 + 2 + 256);
 		t_len += c_len + v_len;
 	}
@@ -512,12 +515,16 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 
 	tmp = p;
 	p = quic_put_pkt_num(p, QUIC_MT_CERTIFICATE, 1);
-	p = quic_put_pkt_num(p, 2 + clen + 3 + 4, 3);
+	p = quic_put_pkt_num(p, clen + 4, 3);
 	p = quic_put_pkt_num(p, 0, 1);
-	p = quic_put_pkt_num(p, 2 + clen + 3, 3);
 	p = quic_put_pkt_num(p, clen, 3);
-	p = quic_put_pkt_data(p, qs->crypt.crt.v, clen);
-	p = quic_put_pkt_num(p, 0, 2);
+
+	for (c = qs->crypt.certs; c; c = c->next) {
+		p = quic_put_pkt_num(p, c->raw.len, 3);
+		p = quic_put_pkt_data(p, c->raw.v, c->raw.len);
+		p = quic_put_pkt_num(p, 0, 2);
+	}
+
 	qs->crypt.hs_buf[QUIC_H_CERT].len = (u32)(p - tmp);
 	qs->crypt.hs_buf[QUIC_H_CERT].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CERT].len);
 	if (!qs->crypt.hs_buf[QUIC_H_CERT].v)
@@ -559,18 +566,21 @@ fin:
 	f_len = 4 + m_len;
 	f->len += f_len;
 	pr_debug("hs_crypto p_len: %u, e_len: %u, f_len: %u\n", p_len, e_len, f_len);
-	if (m_len < t_len) {
-		f = &qs->frame.f[QUIC_FR_NR - 1];
+	while (m_len < t_len) {
+		f = &qs->frame.f[QUIC_PKT_SHORT + i];
 
 		t_len = t_len - m_len;
+		v_len = m_len < t_len ? m_len : t_len;
 		p = f->v + f->len;
 		p = quic_put_varint(p, QUIC_FRAME_CRYPTO);
-		p = quic_put_varint(p, m_len);
-		p = quic_put_varint(p, t_len);
-		p = quic_put_pkt_data(p, tmp + m_len, t_len);
+		p = quic_put_varint(p, m_len * i);
+		p = quic_put_varint(p, v_len);
+		p = quic_put_pkt_data(p, tmp + m_len, v_len);
 		f->len = (u32)(p - f->v);
 		pr_debug("hs_crypto t_len: %u,  m_len: %u, f_len: %u\n",
-			 t_len, m_len, f->len);
+				t_len, m_len, f->len);
+		tmp += m_len;
+		i++;
 	}
 
 	return quic_crypto_application_keys_install(qs);
@@ -1581,7 +1591,7 @@ int quic_frame_process(struct quic_sock *qs, u8 *p, u32 len)
 	while (1) {
 		v = quic_get_varint_next(&p, &len);
 		left -= len;
-		pr_debug("ch type: %x\n", v);
+		pr_debug("frame type: %x\n", v);
 
 		if (v != QUIC_FRAME_ACK && v != QUIC_FRAME_PADDING)
 			qs->frame.need_ack = 1;
@@ -1590,13 +1600,13 @@ int quic_frame_process(struct quic_sock *qs, u8 *p, u32 len)
 			qs->frame.non_probe = 1;
 
 		if (v > QUIC_FRAME_BASE_MAX) {
-			pr_err_once("ch packet: unsupported frame %u\n", v);
+			pr_err_once("frame err: unsupported frame %u\n", v);
 			err = -EPROTONOSUPPORT;
 			break;
 		}
 		err = quic_frames[v].frame_process(qs, &p, v, left);
 		if (err) {
-			pr_warn("ch err %d\n", err);
+			pr_warn("frame err %u %d\n", v, err);
 			break;
 		}
 
