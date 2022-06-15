@@ -89,6 +89,12 @@ How to Use It
     # sh server_keys.sh
     # sh client_keys.sh
 
+  or for token/retry example test by:
+
+    # cd tools/testing/selftests/net/quic/
+    # sh server_token.sh
+    # sh client_token.sh
+
   and it can also interact with ngtcp2, after building ngtcp2:
 
     # cd ngtcp2/examples/
@@ -109,7 +115,6 @@ TODO
   - Protocol:
     * Add ICMP(v6) TooBig/FragNeeded Prcess and PLPMTUD.
     * Add more socket options and send/recv parameters.
-    * Retry and Version Negotiation.
 
   - Handshake:
     * Adjust code to support more crypto algorithms.

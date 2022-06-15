@@ -544,6 +544,44 @@ static void *quic_crypto_aead_mem_alloc(struct crypto_aead *tfm, u8 **iv,
 	return (void *)mem;
 }
 
+/* exported */
+int quic_crypto_retry_encrypt(struct quic_sock *qs, u8 *in, u32 len, u8 *out)
+{
+	static u8 tx_key[16] = "\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e";
+	static u8 tx_iv[12] = "\x46\x15\x99\xd3\x5d\x63\x2b\xf2\x23\x98\x25\xbb";
+	struct aead_request *req;
+	struct crypto_aead *tfm;
+	struct scatterlist *sg;
+	void *ctx;
+	int err;
+	u8 *iv;
+
+	tfm = qs->crypt.aead_tfm;
+	err = crypto_aead_setauthsize(tfm, QUIC_TAGLEN);
+	if (err)
+		return err;
+	err = crypto_aead_setkey(tfm, tx_key, QUIC_KEYLEN);
+	if (err)
+		return err;
+
+	ctx = quic_crypto_aead_mem_alloc(tfm, &iv, &req, &sg, 2);
+	if (!ctx)
+		return err;
+
+	sg_init_table(sg, 2);
+	sg_set_buf(&sg[0], in, len);
+	sg_set_buf(&sg[1], out, 16);
+
+	memcpy(iv, tx_iv, QUIC_IVLEN);
+	aead_request_set_tfm(req, tfm);
+	aead_request_set_ad(req, len);
+	aead_request_set_crypt(req, sg, sg, 0, iv);
+	err = crypto_aead_encrypt(req);
+
+	kfree(ctx);
+	return err;
+}
+
 static int quic_crypto_pd_encrypt(struct quic_sock *qs, struct sk_buff *skb, u8 *tx_key, u8 *tx_iv)
 {
 	struct aead_request *req;
@@ -988,6 +1026,8 @@ int quic_crypto_encrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 		key = qs->crypt.l3_tx_key[k];
 		iv = qs->crypt.l3_tx_iv[k];
 		hp_key = qs->crypt.l3_tx_hp_key;
+	} else {
+		return 0;
 	}
 
 	err = quic_crypto_pd_encrypt(qs, skb, key, iv);
@@ -1000,8 +1040,8 @@ int quic_crypto_encrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 /* exported */
 int quic_crypto_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 {
-	struct quic_shdr *hdr;
 	u8 *key, *iv, *hp_key;
+	struct quic_shdr *hdr;
 	int err;
 
 	if (type == QUIC_PKT_INITIAL) {
@@ -1019,7 +1059,7 @@ int quic_crypto_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type)
 	} else if (type == QUIC_PKT_SHORT) {
 		hp_key = qs->crypt.l3_rx_hp_key;
 	} else {
-		pr_warn("crypto unsupport type %d\n", type);
+		return 0;
 	}
 
 	err = quic_crypto_hd_decrypt(qs, skb, hp_key);

@@ -327,6 +327,19 @@ static int quic_frame_padding_create(struct quic_sock *qs)
 
 static int quic_frame_new_token_create(struct quic_sock *qs)
 {
+	struct quic_vlen *f = &qs->frame.f[qs->packet.type];
+	u8 *p, *tmp;
+	u32 f_len;
+
+	p = f->v + f->len;
+	tmp = p;
+	p = quic_put_varint(p, QUIC_FRAME_NEW_TOKEN);
+	p = quic_put_varint(p, qs->token.len);
+	p = quic_put_pkt_data(p, qs->token.token, qs->token.len);
+	f_len = (u32)(p - tmp);
+	f->len += f_len;
+	pr_debug("create new token frame len: %u\n", f_len);
+
 	return 0;
 }
 
@@ -567,7 +580,7 @@ fin:
 	f->len += f_len;
 	pr_debug("hs_crypto p_len: %u, e_len: %u, f_len: %u\n", p_len, e_len, f_len);
 	while (m_len < t_len) {
-		f = &qs->frame.f[QUIC_PKT_SHORT + i];
+		f = &qs->frame.f[QUIC_PKT_VERSION_NEGOTIATION + i];
 
 		t_len = t_len - m_len;
 		v_len = m_len < t_len ? m_len : t_len;
@@ -1202,13 +1215,18 @@ static int quic_frame_new_token_process(struct quic_sock *qs, u8 **ptr, u8 type,
 {
 	u8 *p = *ptr;
 	u32 v, len;
+	int err;
 
 	len = quic_get_varint_next(&p, &v);
 	pr_debug("Token Length: %u\n", len);
-	kfree(qs->token.v);
+	kfree(qs->token.token);
 	qs->token.len = len;
-	qs->token.v = quic_mem_dup(p, len);
+	qs->token.token = quic_mem_dup(p, len);
 	p += len;
+
+	err = quic_evt_notify_token(qs);
+	if (err)
+		return err;
 
 	*ptr = p;
 	return 0;

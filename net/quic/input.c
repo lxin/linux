@@ -274,6 +274,11 @@ void quic_receive_list_free(struct quic_sock *qs)
 		kfree_skb(skb);
 		skb = __skb_dequeue(&sk->sk_receive_queue);
 	}
+	kfree_skb(qs->packet.fc_md);
+	kfree_skb(qs->packet.fc_msd);
+	kfree_skb(qs->packet.ticket);
+	kfree_skb(qs->packet.ku);
+	kfree_skb(qs->packet.token);
 }
 
 int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[])
@@ -334,6 +339,32 @@ int quic_evt_notify_ticket(struct quic_sock *qs)
 	memcpy(em->data + 8 + psk->pskid.len + psk->nonce.len, psk->mskey.v, psk->mskey.len);
 
 	pr_debug("event created %u %u\n", QUIC_EVT_TICKET, QUIC_EVT_TICKET_NEW);
+	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	sk->sk_data_ready(sk);
+	return 0;
+}
+
+int quic_evt_notify_token(struct quic_sock *qs)
+{
+	struct sock *sk = &qs->inet.sk;
+	struct quic_evt_msg *em;
+	struct sk_buff *skb;
+
+	if (!(qs->packet.events & (1 << QUIC_EVT_TOKEN)))
+		return 0;
+
+	skb = alloc_skb(sizeof(*em) + qs->token.len, GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	QUIC_RCV_CB(skb)->is_evt = 1;
+	em = skb_put(skb, sizeof(*em) + qs->token.len);
+	em->evt_type = QUIC_EVT_TOKEN;
+	em->sub_type = QUIC_EVT_TOKEN_NEW;
+	em->value[0] = qs->token.len;
+	memcpy(em->data, qs->token.token, qs->token.len);
+
+	pr_debug("event created %u %u\n", QUIC_EVT_TOKEN, QUIC_EVT_TOKEN_NEW);
 	__skb_queue_tail(&sk->sk_receive_queue, skb);
 	sk->sk_data_ready(sk);
 	return 0;

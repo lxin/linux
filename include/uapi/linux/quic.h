@@ -43,6 +43,7 @@ enum quic_evt_type {
 	QUIC_EVT_ADDRESS,	/* NEW */
 	QUIC_EVT_TICKET,	/* NEW */
 	QUIC_EVT_KEY,		/* NEW */
+	QUIC_EVT_TOKEN,		/* NEW */
 	QUIC_EVT_MAX,
 };
 
@@ -69,6 +70,10 @@ enum quic_evt_ticket_type {
 
 enum quic_evt_key_type {
 	QUIC_EVT_KEY_NEW,
+};
+
+enum quic_evt_token_type {
+	QUIC_EVT_TOKEN_NEW,
 };
 
 struct quic_evt_msg {
@@ -113,6 +118,10 @@ struct quic_evt_msg {
 /* certificate chain */
 #define QUIC_SOCKOPT_CERT_CHAIN		18
 #define QUIC_SOCKOPT_ROOT_CA		19
+
+/* token */
+#define QUIC_SOCKOPT_NEW_TOKEN		20
+#define QUIC_SOCKOPT_LOAD_TOKEN		21
 
 #define MSG_NOTIFICATION		0x8000
 

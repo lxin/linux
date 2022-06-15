@@ -175,6 +175,11 @@ struct quic_vlen {
 	__u32 len;
 };
 
+struct quic_token {
+	__u8 *token;
+	__u8 len;
+};
+
 #define QUIC_MSG_legacy_version	0x0303
 #define QUIC_AES_128_GCM_SHA256	0x1301
 #define QUIC_ECDHE_secp256r1	0x0017
@@ -218,15 +223,15 @@ struct quic_initial_param {
 #define QUIC_H_COUNT	7
 
 enum quic_pkt_type {
-	QUIC_PKT_VERSION_NEGOTIATION = 0xf0,
 	QUIC_PKT_INITIAL = 0x0,
 	QUIC_PKT_0RTT = 0x1,
 	QUIC_PKT_HANDSHAKE = 0x2,
 	QUIC_PKT_RETRY = 0x3,
-	QUIC_PKT_SHORT = 0x4
+	QUIC_PKT_SHORT = 0x4,
+	QUIC_PKT_VERSION_NEGOTIATION = 0x5
 };
 
-#define QUIC_FR_NR	(QUIC_PKT_SHORT + 1 + 2)
+#define QUIC_FR_NR	(QUIC_PKT_VERSION_NEGOTIATION + 1 + 2)
 
 struct quic_psk {
 	struct quic_psk *next;
@@ -354,7 +359,9 @@ struct quic_packet {
 	struct sk_buff *fc_md;
 	struct sk_buff *fc_msd;
 	struct sk_buff *ticket;
+	struct sk_buff *token;
 	struct sk_buff *ku;
+	u32 early_len;
 	u32 in_tx_pn;
 	u32 hs_tx_pn;
 	u32 ad_tx_pn;
@@ -411,8 +418,6 @@ struct quic_sock {
 	struct quic_sock	*lsk; /* listening sock */
 	struct quic_af		*af;  /* inet4 or inet6 */
 
-	struct quic_vlen	token;
-
 	struct quic_params	params;
 	enum quic_state		state;
 
@@ -423,6 +428,7 @@ struct quic_sock {
 	struct quic_cids	cids;
 	struct quic_path	path;
 	struct quic_cong	cong;
+	struct quic_token	token;
 
 	struct timer_list	hs_timer;
 	struct timer_list	rtx_timer;
@@ -749,10 +755,10 @@ struct quic_rcv_cb {
 	u8 *scid;
 	u8 dcid_len;
 	u8 scid_len;
-	u32 strm_id;
-	u32 strm_off;
 	u8 strm_fin:1,
 	   is_evt:1;
+	u32 strm_id;
+	u32 strm_off;
 	u32 udp_hdr;
 	u32 pn;
 };
@@ -937,7 +943,7 @@ static inline union quic_addr *quic_daddr_cur(struct quic_sock *qs)
 struct quic_af *quic_af_get(sa_family_t family);
 int quic_dst_mss_check(struct quic_sock *qs, int hdr);
 void quic_cert_free(struct quic_cert *cert);
-struct quic_cert *quic_cert_create(struct x509_certificate *x, u8 *cert, int len);
+struct quic_cert *quic_cert_create(u8 *cert, int len);
 
 /* udp.c */
 struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs, union quic_addr *a);
@@ -967,6 +973,7 @@ void quic_start_ping_timer(struct quic_sock *qs, u8 restart);
 void quic_stop_ping_timer(struct quic_sock *qs);
 
 /* packet.c */
+int quic_packet_pre_process(struct quic_sock *qs, struct sk_buff *skb);
 int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb);
 struct sk_buff *quic_packet_create(struct quic_sock *qs, u8 type, u8 ftype);
 
@@ -1002,6 +1009,7 @@ int quic_crypto_psk_create(struct quic_sock *qs, u8 *pskid, u32 pskid_len,
 			   u8 *nonce, u32 nonce_len, u8 *mskey, u32 mskey_len);
 void quic_crypto_psk_free(struct quic_sock *qs);
 int quic_crypto_key_update(struct quic_sock *qs);
+int quic_crypto_retry_encrypt(struct quic_sock *qs, u8 *in, u32 len, u8 *out);
 
 /* input.c */
 int quic_rcv(struct sk_buff *skb);
@@ -1009,6 +1017,7 @@ int quic_do_rcv(struct sock *sk, struct sk_buff *skb);
 int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb);
 void quic_receive_list_del(struct quic_sock *qs, u32 sid);
 int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[]);
+int quic_evt_notify_token(struct quic_sock *qs);
 int quic_evt_notify_ticket(struct quic_sock *qs);
 void quic_receive_list_free(struct quic_sock *qs);
 

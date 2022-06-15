@@ -190,7 +190,7 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 		struct quic_cert *c, *p, *tmp, *certs = NULL;
 
 		for (p = qs->crypt.certs; p; p = p->next) {
-			c = quic_cert_create(p->cert, p->raw.v, p->raw.len);
+			c = quic_cert_create(p->raw.v, p->raw.len);
 			if (!c) {
 				nqs->crypt.certs = certs;
 				return -ENOMEM;
@@ -234,6 +234,7 @@ struct quic_sock *quic_sock_create(struct quic_sock *qs)
 		return NULL;
 	}
 	nqs->state = QUIC_CS_SERVER_INITIAL;
+	nqs->lsk = qs;
 
 	return nqs;
 }
@@ -252,16 +253,19 @@ struct quic_sock *quic_lsk_process(struct quic_sock *qs, struct sk_buff *skb)
 	err = quic_sock_init(nqs, &src, cb->scid, cb->scid_len,
 			     cb->dcid, cb->dcid_len);
 	if (err) {
-		quic_sock_free(qs);
+		quic_sock_free(nqs);
 		return NULL;
 	}
 	err = quic_crypto_initial_keys_install(nqs);
 	if (err) {
-		quic_sock_free(qs);
+		quic_sock_free(nqs);
 		return NULL;
 	}
-
-	nqs->lsk = qs;
+	err = quic_packet_pre_process(nqs, skb);
+	if (err) {
+		quic_sock_free(nqs);
+		return NULL;
+	}
 	return nqs;
 }
 

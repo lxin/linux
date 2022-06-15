@@ -264,6 +264,12 @@ void quic_send_list_free(struct quic_sock *qs)
 		kfree_skb(skb);
 		skb = __skb_dequeue(&sk->sk_write_queue);
 	}
+
+	kfree_skb(qs->packet.fc_md);
+	kfree_skb(qs->packet.fc_msd);
+	kfree_skb(qs->packet.ticket);
+	kfree_skb(qs->packet.token);
+	kfree_skb(qs->packet.ku);
 }
 
 void quic_write_queue_enqueue(struct quic_sock *qs, struct sk_buff *skb)
@@ -394,6 +400,21 @@ void quic_send_queue_check(struct quic_sock *qs, u32 v)
 		}
 	}
 
+	if (qs->packet.token && QUIC_SND_CB(qs->packet.token)->pn == v) {
+		kfree(qs->lsk->token.token);
+		qs->lsk->token.token = quic_mem_dup(qs->token.token, qs->token.len);
+		if (qs->lsk->token.token) {
+			kfree_skb(qs->packet.token);
+			qs->packet.token = NULL;
+			qs->lsk->token.len = qs->token.len;
+			err = quic_evt_notify_token(qs);
+			if (err) {
+				qs->inet.sk.sk_err = err;
+				pr_warn("notify token fails %d\n", err);
+			}
+		}
+	}
+
 	if (qs->inet.sk.sk_send_head || qs->packet.fc_md || qs->packet.fc_msd ||
 	    qs->packet.ticket) {
 		quic_start_rtx_timer(qs, 1);
@@ -419,6 +440,15 @@ int quic_send_queue_rtx(struct quic_sock *qs)
 
 	if (qs->packet.fc_md) {
 		n = skb_clone(qs->packet.fc_md, GFP_ATOMIC);
+		if (!n)
+			return -ENOMEM;
+		skb_set_owner_w(n, sk);
+		qs->af->lower_xmit(qs, n);
+		start_timer = 1;
+	}
+
+	if (qs->packet.token) {
+		n = skb_clone(qs->packet.token, GFP_ATOMIC);
 		if (!n)
 			return -ENOMEM;
 		skb_set_owner_w(n, sk);

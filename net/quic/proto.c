@@ -392,11 +392,14 @@ static void quic_close(struct sock *sk, long timeout)
 	} else if (sk->sk_state != QUIC_SS_CLOSED) {
 		pr_info("close %u %u\n", READ_ONCE(sk->sk_sndbuf),
 			READ_ONCE(sk->sk_wmem_queued));
-		qs->frame.close.err = QUIC_ERROR_NO_ERROR;
-		skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_CONNECTION_CLOSE_APP);
-		if (skb) {
-			quic_write_queue_enqueue(qs, skb);
-			quic_write_queue_flush(qs);
+		if (qs->state != QUIC_CS_CLOSING) {
+			qs->frame.close.err = QUIC_ERROR_NO_ERROR;
+			skb = quic_packet_create(qs, QUIC_PKT_SHORT,
+						 QUIC_FRAME_CONNECTION_CLOSE_APP);
+			if (skb) {
+				quic_write_queue_enqueue(qs, skb);
+				quic_write_queue_flush(qs);
+			}
 		}
 		qs->state = QUIC_CS_CLOSING;
 		quic_sock_free(qs);
@@ -923,21 +926,28 @@ int quic_inet_getname(struct socket *sock, struct sockaddr *uaddr, int peer)
 	return quic_sk(sock->sk)->af->get_name(sock, uaddr, peer);
 }
 
-struct quic_cert *quic_cert_create(struct x509_certificate *x, u8 *cert, int len)
+struct quic_cert *quic_cert_create(u8 *cert, int len)
 {
+	struct x509_certificate *x;
 	struct quic_cert *c;
 
 	c = kzalloc(sizeof(*c), GFP_ATOMIC);
 	if (!c)
 		return NULL;
 
-	c->cert = x;
 	c->raw.len = len;
 	c->raw.v = quic_mem_dup(cert, len);
 	if (!c->raw.v) {
 		kfree(c);
 		return NULL;
 	}
+
+	x = x509_cert_parse(c->raw.v, len);
+	if (IS_ERR(x)) {
+		quic_cert_free(c);
+		return NULL;
+	}
+	c->cert = x;
 
 	return c;
 }
@@ -958,7 +968,6 @@ void quic_cert_free(struct quic_cert *cert)
 static int quic_setsockopt_root_ca(struct sock *sk, u8 *cert, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
-	struct x509_certificate *x;
 	struct quic_cert *c;
 
 	if (!len) {
@@ -967,15 +976,9 @@ static int quic_setsockopt_root_ca(struct sock *sk, u8 *cert, unsigned int len)
 		return 0;
 	}
 
-	x = x509_cert_parse(cert, len);
-	if (IS_ERR(x))
-		return PTR_ERR(x);
-
-	c = quic_cert_create(x, cert, len);
-	if (!c) {
-		kfree(x);
+	c = quic_cert_create(cert, len);
+	if (!c)
 		return -ENOMEM;
-	}
 
 	qs->crypt.ca = c;
 	return 0;
@@ -984,7 +987,6 @@ static int quic_setsockopt_root_ca(struct sock *sk, u8 *cert, unsigned int len)
 static int quic_setsockopt_cert(struct sock *sk, u8 *cert, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
-	struct x509_certificate *x;
 	struct quic_cert *c, *p;
 
 	if (!len) {
@@ -993,15 +995,9 @@ static int quic_setsockopt_cert(struct sock *sk, u8 *cert, unsigned int len)
 		return 0;
 	}
 
-	x = x509_cert_parse(cert, len);
-	if (IS_ERR(x))
-		return PTR_ERR(x);
-
-	c = quic_cert_create(x, cert, len);
-	if (!c) {
-		kfree(x);
+	c = quic_cert_create(cert, len);
+	if (!c)
 		return -ENOMEM;
-	}
 
 	p = qs->crypt.certs;
 	if (p) {
@@ -1019,25 +1015,18 @@ static int quic_setsockopt_cert_chain(struct sock *sk, u8 *cert, unsigned int le
 {
 	struct quic_cert *c, *certs = NULL, *p = NULL;
 	struct quic_sock *qs = quic_sk(sk);
-	struct x509_certificate *x;
-	int clen;
+	int clen, err = 0;
 
 	while (len > 0) {
 		clen = *((u32 *)cert);
 		cert += 4;
 		len -= 4;
-		x = x509_cert_parse(cert, clen);
-		if (IS_ERR(x)) {
-			quic_cert_free(p);
-			return PTR_ERR(x);
+		c = quic_cert_create(cert, clen);
+		if (!c) {
+			err = -ENOMEM;
+			goto out;
 		}
 
-		c = quic_cert_create(x, cert, clen);
-		if (!c) {
-			kfree(x);
-			quic_cert_free(p);
-			return -ENOMEM;
-		}
 		cert += clen;
 		len -= clen;
 		if (!certs)
@@ -1047,6 +1036,7 @@ static int quic_setsockopt_cert_chain(struct sock *sk, u8 *cert, unsigned int le
 		p = c;
 	}
 
+out:
 	quic_cert_free(qs->crypt.certs);
 	qs->crypt.certs = certs;
 
@@ -1310,6 +1300,54 @@ static int quic_setsockopt_key_update(struct sock *sk, u8 *key, unsigned int len
 	return 0;
 }
 
+static int quic_setsockopt_new_token(struct sock *sk, u8 *token, unsigned int len)
+{
+	struct quic_sock *qs = quic_sk(sk);
+	struct sk_buff *skb;
+	char t[8];
+
+	if (!qs->lsk)
+		return -EINVAL;
+
+	if (!len) {
+		token = t;
+		get_random_bytes(token, 8);
+		len = 8;
+	}
+
+	kfree(qs->token.token);
+	qs->token.token = quic_mem_dup(token, len);
+	if (!qs->token.token)
+		return -ENOMEM;
+	qs->token.len = len;
+
+	skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_NEW_TOKEN);
+	if (!skb)
+		return -ENOMEM;
+	qs->packet.token = skb;
+
+	skb = skb_clone(skb, GFP_ATOMIC);
+	if (skb) {
+		quic_write_queue_enqueue(qs, skb);
+		quic_write_queue_flush(qs);
+	}
+
+	return 0;
+}
+
+static int quic_setsockopt_load_token(struct sock *sk, u8 *token, unsigned int len)
+{
+	struct quic_sock *qs = quic_sk(sk);
+
+	kfree(qs->token.token);
+	qs->token.token = quic_mem_dup(token, len);
+	if (!qs->token.token)
+		return -ENOMEM;
+	qs->token.len = len;
+
+	return 0;
+}
+
 static int quic_setsockopt_new_cid(struct sock *sk, u32 *cid, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
@@ -1488,6 +1526,12 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 		break;
 	case QUIC_SOCKOPT_KEY_UPDATE:
 		retval = quic_setsockopt_key_update(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_NEW_TOKEN:
+		retval = quic_setsockopt_new_token(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_LOAD_TOKEN:
+		retval = quic_setsockopt_load_token(sk, kopt, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;

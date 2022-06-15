@@ -25,7 +25,6 @@ static int quic_msg_encrypted_extension_process(struct quic_sock *qs, u8 *p, u32
 static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 {
 	struct quic_cert *c, *certs = NULL, *tmp = NULL;
-	struct x509_certificate *x;
 	u8 *cert_p;
 	u32 clen;
 
@@ -42,13 +41,8 @@ static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 	while (1) {
 		len = quic_get_fixint_next(&p, 3);
 		pr_debug("cert one len %u\n", len);
-		x = x509_cert_parse(p, len);
-		if (IS_ERR(x))
-			return PTR_ERR(x);
-
-		c = quic_cert_create(x, p, len);
+		c = quic_cert_create(p, len);
 		if (!c) {
-			kfree(x);
 			qs->crypt.certs = certs;
 			return -ENOMEM;
 		}
