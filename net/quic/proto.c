@@ -1348,6 +1348,15 @@ static int quic_setsockopt_load_token(struct sock *sk, u8 *token, unsigned int l
 	return 0;
 }
 
+static int quic_setsockopt_cert_request(struct sock *sk, u8 *v, unsigned int len)
+{
+	if (!len)
+		return -EINVAL;
+
+	quic_sk(sk)->crypt.cert_req = !!(*v);
+	return 0;
+}
+
 static int quic_setsockopt_new_cid(struct sock *sk, u32 *cid, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
@@ -1469,12 +1478,6 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 	}
 
 	listen = sk->sk_state == QUIC_SS_LISTENING;
-	if ((optname == QUIC_SOCKOPT_CERT || optname == QUIC_SOCKOPT_CERT_CHAIN ||
-	     optname == QUIC_SOCKOPT_PKEY) ^ listen) {
-		retval = -EINVAL;
-		goto out;
-	}
-
 	switch (optname) {
 	case QUIC_SOCKOPT_CERT:
 		retval = quic_setsockopt_cert(sk, kopt, optlen);
@@ -1532,6 +1535,9 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 		break;
 	case QUIC_SOCKOPT_LOAD_TOKEN:
 		retval = quic_setsockopt_load_token(sk, kopt, optlen);
+		break;
+	case QUIC_SOCKOPT_CERT_REQUEST:
+		retval = quic_setsockopt_cert_request(sk, kopt, optlen);
 		break;
 	default:
 		retval = -ENOPROTOOPT;

@@ -216,11 +216,14 @@ struct quic_initial_param {
 #define QUIC_H_CH	0
 #define QUIC_H_SH	1
 #define QUIC_H_EE	2
-#define QUIC_H_CERT	3
-#define QUIC_H_CVFY	4
-#define QUIC_H_SFIN	5
-#define QUIC_H_CFIN	6
-#define QUIC_H_COUNT	7
+#define QUIC_H_CREQ	3
+#define QUIC_H_SCERT	4
+#define QUIC_H_SCVFY	5
+#define QUIC_H_SFIN	6
+#define QUIC_H_CCERT	7
+#define QUIC_H_CCVFY	8
+#define QUIC_H_CFIN	9
+#define QUIC_H_COUNT	10
 
 enum quic_pkt_type {
 	QUIC_PKT_INITIAL = 0x0,
@@ -272,6 +275,7 @@ struct quic_crypt {
 	u8 hash5[QUIC_HASHLEN];
 	u8 hash6[QUIC_HASHLEN];
 	u8 hash7[QUIC_HASHLEN];
+	u8 hash8[QUIC_HASHLEN];
 	u8 hash9[QUIC_HASHLEN];
 
 	struct crypto_kpp *kpp_tfm;
@@ -311,13 +315,16 @@ struct quic_crypt {
 
 	struct crypto_akcipher *akc_tfm;
 	struct quic_cert *certs;
+	struct quic_cert *rcerts;
 	struct quic_cert *ca;
 	struct quic_vlen pkey;
 	struct quic_vlen sig;
 
 	struct quic_psk *psks;
 	u8 key_phase:1,
-	   key_pending:1;
+	   key_pending:1,
+	   cert_req:1,
+	   is_serv:1;
 };
 
 struct quic_frame {
@@ -998,9 +1005,9 @@ int quic_crypto_early_keys_prepare(struct quic_sock *qs);
 int quic_crypto_early_keys_install(struct quic_sock *qs);
 int quic_crypto_early_binder_create(struct quic_sock *qs, u8 *v, u32 len);
 int quic_crypto_rms_key_install(struct quic_sock *qs);
-int quic_crypto_server_cert_verify(struct quic_sock *qs);
-int quic_crypto_server_certvfy_sign(struct quic_sock *qs);
-int quic_crypto_server_certvfy_verify(struct quic_sock *qs);
+int quic_crypto_cert_verify(struct quic_sock *qs);
+int quic_crypto_certvfy_sign(struct quic_sock *qs);
+int quic_crypto_certvfy_verify(struct quic_sock *qs);
 int quic_crypto_server_finished_create(struct quic_sock *qs, u8 *sf);
 int quic_crypto_server_finished_verify(struct quic_sock *qs);
 int quic_crypto_client_finished_create(struct quic_sock *qs, u8 *cf);

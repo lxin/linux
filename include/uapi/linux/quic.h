@@ -123,6 +123,8 @@ struct quic_evt_msg {
 #define QUIC_SOCKOPT_NEW_TOKEN		20
 #define QUIC_SOCKOPT_LOAD_TOKEN		21
 
+#define QUIC_SOCKOPT_CERT_REQUEST	22
+
 #define MSG_NOTIFICATION		0x8000
 
 #endif /* _UAPI_QUIC_H */

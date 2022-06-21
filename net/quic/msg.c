@@ -25,12 +25,13 @@ static int quic_msg_encrypted_extension_process(struct quic_sock *qs, u8 *p, u32
 static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 {
 	struct quic_cert *c, *certs = NULL, *tmp = NULL;
-	u8 *cert_p;
+	u8 *cert_p, ctype;
 	u32 clen;
 
-	qs->crypt.hs_buf[QUIC_H_CERT].len = len + 4;
-	qs->crypt.hs_buf[QUIC_H_CERT].v = quic_mem_dup(p - 4, qs->crypt.hs_buf[QUIC_H_CERT].len);
-	if (!qs->crypt.hs_buf[QUIC_H_CERT].v)
+	ctype = quic_is_serv(qs) ? QUIC_H_CCERT : QUIC_H_SCERT;
+	qs->crypt.hs_buf[ctype].len = len + 4;
+	qs->crypt.hs_buf[ctype].v = quic_mem_dup(p - 4, qs->crypt.hs_buf[ctype].len);
+	if (!qs->crypt.hs_buf[ctype].v)
 		return -ENOMEM;
 
 	pr_debug("cert context %x\n", *p);
@@ -43,7 +44,7 @@ static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 		pr_debug("cert one len %u\n", len);
 		c = quic_cert_create(p, len);
 		if (!c) {
-			qs->crypt.certs = certs;
+			qs->crypt.rcerts = certs;
 			return -ENOMEM;
 		}
 		if (!certs)
@@ -60,18 +61,34 @@ static int quic_msg_certificate_process(struct quic_sock *qs, u8 *p, u32 len)
 		if ((u32)(p - cert_p) >= clen)
 			break;
 	}
-	qs->crypt.certs = certs;
 
-	return quic_crypto_server_cert_verify(qs);
+	qs->crypt.rcerts = certs;
+
+	return quic_crypto_cert_verify(qs);
+}
+
+static int quic_msg_certificate_request_process(struct quic_sock *qs, u8 *p, u32 len)
+{
+	qs->crypt.hs_buf[QUIC_H_CREQ].len = len + 4;
+	qs->crypt.hs_buf[QUIC_H_CREQ].v = quic_mem_dup(p - 4, qs->crypt.hs_buf[QUIC_H_CREQ].len);
+	if (!qs->crypt.hs_buf[QUIC_H_CREQ].v)
+		return -ENOMEM;
+
+	len = quic_get_fixint_next(&p, 1);
+	pr_debug("cert request len: %d\n", len);
+	p += len;
+
+	return quic_exts_process(qs, p);
 }
 
 static int quic_msg_certificate_verify_process(struct quic_sock *qs, u8 *p, u32 len)
 {
-	u32 v;
+	u32 v, vtype;
 
-	qs->crypt.hs_buf[QUIC_H_CVFY].len = len + 4;
-	qs->crypt.hs_buf[QUIC_H_CVFY].v = quic_mem_dup(p - 4, qs->crypt.hs_buf[QUIC_H_CVFY].len);
-	if (!qs->crypt.hs_buf[QUIC_H_CVFY].v)
+	vtype = quic_is_serv(qs) ? QUIC_H_CCVFY : QUIC_H_SCVFY;
+	qs->crypt.hs_buf[vtype].len = len + 4;
+	qs->crypt.hs_buf[vtype].v = quic_mem_dup(p - 4, qs->crypt.hs_buf[vtype].len);
+	if (!qs->crypt.hs_buf[vtype].v)
 		return -ENOMEM;
 
 	v = quic_get_fixint_next(&p, 2);
@@ -82,7 +99,7 @@ static int quic_msg_certificate_verify_process(struct quic_sock *qs, u8 *p, u32 
 	if (!qs->crypt.sig.v)
 		return -ENOMEM;
 
-	return quic_crypto_server_certvfy_verify(qs);
+	return quic_crypto_certvfy_verify(qs);
 }
 
 static int quic_msg_server_finished_process(struct quic_sock *qs, u8 *p, u32 len)
@@ -292,7 +309,7 @@ static struct quic_msg_ops quic_msgs[QUIC_MT_MAX + 1] = {
 	{quic_msg_unsupported_process},
 	{quic_msg_certificate_process},
 	{quic_msg_unsupported_process},
-	{quic_msg_unsupported_process},
+	{quic_msg_certificate_request_process},
 	{quic_msg_unsupported_process},
 	{quic_msg_certificate_verify_process},
 	{quic_msg_unsupported_process}, /* 16 */

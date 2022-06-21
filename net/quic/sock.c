@@ -209,10 +209,11 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 			return -ENOMEM;
 		nqs->crypt.pkey.len = qs->crypt.pkey.len;
 	}
+	nqs->crypt.cert_req = qs->crypt.cert_req;
 	return 0;
 }
 
-struct quic_sock *quic_sock_create(struct quic_sock *qs)
+static struct quic_sock *quic_sock_create(struct quic_sock *qs)
 {
 	struct sock *sk = &qs->inet.sk;
 	struct quic_sock *nqs;
@@ -235,6 +236,7 @@ struct quic_sock *quic_sock_create(struct quic_sock *qs)
 	}
 	nqs->state = QUIC_CS_SERVER_INITIAL;
 	nqs->lsk = qs;
+	nqs->crypt.is_serv = true;
 
 	return nqs;
 }

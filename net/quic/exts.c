@@ -219,8 +219,10 @@ static int quic_exts_signature_algorithms(struct quic_sock *qs, u8 *p, u32 len)
 {
 	int i;
 
-	for (i = 0; i < len; i += 4)
-		pr_debug("signature_algorithms %d: %x", i, *((u16 *)(p + i + 2)));
+	len = quic_get_fixint_next(&p, 2);
+
+	for (i = 0; i < len; i += 2)
+		pr_debug("signature_algorithms %d: %x", i, *((u16 *)(p + i)));
 
 	return 0;
 }

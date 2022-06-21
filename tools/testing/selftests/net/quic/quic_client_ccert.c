@@ -15,9 +15,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-
-#define IPPROTO_QUIC 144
-#define SOL_QUIC 144
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 
 struct quic_sndinfo {
 	uint32_t stream_id;
@@ -32,73 +32,8 @@ enum quic_cmsg_type {
 	QUIC_RCVINFO,
 };
 
-struct quic_scc {
-	uint32_t start;
-	uint32_t cnt;
-	uint32_t cur;
-};
-
-struct quic_idv {
-	uint32_t id;
-	uint32_t value;
-};
-
-enum quic_evt_type {
-	QUIC_EVT_CIDS,		/* NEW, DEL, CUR */
-	QUIC_EVT_STREAMS,	/* RESET, STOP, MAX, BLOCKED */
-	QUIC_EVT_ADDRESS,	/* NEW */
-	QUIC_EVT_MAX,
-};
-
-enum quic_evt_stms_type {
-	QUIC_EVT_STREAMS_RESET,
-	QUIC_EVT_STREAMS_STOP,
-	QUIC_EVT_STREAMS_MAX,
-	QUIC_EVT_STREAMS_BLOCKED,
-};
-
-enum quic_evt_cids_type {
-	QUIC_EVT_CIDS_NEW,
-	QUIC_EVT_CIDS_DEL,
-	QUIC_EVT_CIDS_CUR,
-};
-
-enum quic_evt_addr_type {
-	QUIC_EVT_ADDRESS_NEW,
-};
-
-struct quic_evt_msg {
-	uint8_t evt_type;
-	uint8_t sub_type;
-	uint32_t value[3];
-};
-
-/* certificate and private key */
-#define QUIC_SOCKOPT_CERT		0
-#define QUIC_SOCKOPT_PKEY		1
-
-/* connection id related */
-#define QUIC_SOCKOPT_NEW_SCID		2
-#define QUIC_SOCKOPT_DEL_DCID		3
-#define QUIC_SOCKOPT_CUR_SCID		4
-#define QUIC_SOCKOPT_CUR_DCID		5
-#define QUIC_SOCKOPT_ALL_SCID		6
-#define QUIC_SOCKOPT_ALL_DCID		7
-
-/* connection migration related */
-#define QUIC_SOCKOPT_CUR_SADDR		8
-
-/* stream operation related */
-#define QUIC_SOCKOPT_RESET_STREAM	9
-#define QUIC_SOCKOPT_STOP_SENDING	10
-#define QUIC_SOCKOPT_STREAM_STATE	11
-#define QUIC_SOCKOPT_MAX_STREAMS	12
-
-/* event */
-#define QUIC_SOCKOPT_EVENT		13
-#define QUIC_SOCKOPT_EVENTS		14
-
-#define MSG_NOTIFICATION		0x8000
+#define IPPROTO_QUIC	144
+#define SOL_QUIC	144
 
 int quic_recvmsg(int s, void *msg, size_t len, struct quic_rcvinfo *rinfo, int *msg_flags)
 {
@@ -171,13 +106,51 @@ int quic_sendmsg(int s, const void *msg, size_t len, uint32_t flags, uint32_t st
 	return sendmsg(s, &outmsg, flags);
 }
 
+int get_cert(char **buf)
+{
+	int fd = open("./ss_cert/cert.der", O_RDONLY);
+	struct stat sb;
+
+	if (fd == -1)
+		return -1;
+	if (stat("./ss_cert/cert.der", &sb) == -1)
+		return -1;
+
+	*buf = malloc(sb.st_size);
+	if (!(*buf))
+		return -ENOMEM;
+	read(fd, *buf, sb.st_size);
+
+	close(fd);
+	return sb.st_size;
+}
+
+int get_pkey(char **buf)
+{
+	int fd = open("./ss_cert/pkey.der", O_RDONLY);
+	struct stat sb;
+
+	if (fd == -1)
+		return -1;
+	if (stat("./ss_cert/pkey.der", &sb) == -1)
+		return -1;
+
+	*buf = malloc(sb.st_size);
+	if (!(*buf))
+		return -ENOMEM;
+	read(fd, *buf, sb.st_size);
+
+	close(fd);
+	return sb.st_size;
+}
+
 int main(void)
 {
-	struct sockaddr_in s_addr, c_addr, n_addr;
-	int sd, ret, sid, len, events, cid, i = 0;
+	struct sockaddr_in s_addr, c_addr;
 	char s_msg[2000], c_msg[2000];
 	struct quic_rcvinfo r;
-	struct quic_idv idv;
+	int sd, ret, buf_len;
+	char *buf;
 
 	sd = socket(AF_INET, SOCK_STREAM, IPPROTO_QUIC);
 
@@ -186,6 +159,20 @@ int main(void)
 	c_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 	if (bind(sd, (struct sockaddr *)&c_addr, sizeof(c_addr)) < 0) {
 		printf("Unable to bind\n");
+		return -1;
+	}
+
+	buf_len = get_cert(&buf);
+	printf("Cert File %d\n", buf_len);
+	if (setsockopt(sd, SOL_QUIC, 0, buf, buf_len) < 0) {
+		printf("Unable to setsockopt cert %d\n", errno);
+		return -1;
+	}
+
+	buf_len = get_pkey(&buf);
+	printf("Priv_key File %d\n", buf_len);
+	if (setsockopt(sd, SOL_QUIC, 1, buf, buf_len) < 0) {
+		printf("Unable to setsockopt pkey %d\n", errno);
 		return -1;
 	}
 
@@ -198,72 +185,30 @@ int main(void)
 	}
 
 	sleep(1);
-	events = 0xf;
-	len = sizeof(events);
-	ret = setsockopt(sd, SOL_QUIC, QUIC_SOCKOPT_EVENTS, &events, len);
-	if (ret < 0) {
-		printf("setsockopt %u %u\n", ret, errno);
-		return 1;
-	}
-
-	sleep(1);
-	len = sizeof(events);
-	ret = getsockopt(sd, SOL_QUIC, QUIC_SOCKOPT_EVENTS, &events, &len);
-	if (ret < 0) {
-		printf("getsockopt %u %u\n", ret, errno);
-		return 1;
-	}
-	printf("events %u\n", events);
-
-	sleep(3);
 	memset(c_msg, 'c', sizeof(c_msg) - 1);
-	ret = quic_sendmsg(sd, c_msg, strlen(c_msg), MSG_EOR, 0);
+	ret = quic_sendmsg(sd, c_msg, strlen(c_msg), 0, 0);
 	if (ret == -1) {
 		printf("send %d %d\n", ret, errno);
 		return 1;
 	}
+	printf("send %d\n", ret);
 
 	sleep(1);
-	while (1) {
-		int msg_flags;
-
-		memset(s_msg, 0, sizeof(s_msg));
-		ret = quic_recvmsg(sd, s_msg, sizeof(s_msg), &r, &msg_flags);
-		if (ret == -1) {
-			printf("recv %d %d\n", ret, errno);
-			return 1;
-		}
-		if (msg_flags & MSG_NOTIFICATION) {
-			char type = s_msg[0];
-
-			if (type == QUIC_EVT_STREAMS)  {
-				struct quic_evt_msg *es = (struct quic_evt_msg *)s_msg;
-
-				printf("notification type %u, %u: %u, %u, %u\n",
-					es->evt_type, es->sub_type,
-					es->value[0], es->value[1], es->value[2]);
-			}
-			if (type == QUIC_EVT_CIDS)  {
-				struct quic_evt_msg *es = (struct quic_evt_msg *)s_msg;
-
-				printf("notification type %u, %u: %u, %u, %u\n",
-					es->evt_type, es->sub_type,
-					es->value[0], es->value[1], es->value[2]);
-			}
-			if (type == QUIC_EVT_ADDRESS)  {
-				struct quic_evt_msg *es = (struct quic_evt_msg *)s_msg;
-
-				printf("notification type %u, %u: %u, %u, %u\n",
-					es->evt_type, es->sub_type,
-					es->value[0], es->value[1], es->value[2]);
-			}
-			continue;
-		}
-
-		printf("data recv %d %d %s\n", ret, r.stream_id, s_msg);
-		if (i++ == 1)
-			break;
+	memset(s_msg, 0, sizeof(s_msg));
+	ret = quic_recvmsg(sd, s_msg, sizeof(s_msg), &r, 0);
+	if (ret == -1) {
+		printf("send %d %d\n", ret, errno);
+		return 1;
 	}
+	printf("recv %d %d %s\n", ret, r.stream_id, s_msg);
+
+	memset(s_msg, 0, sizeof(s_msg));
+	ret = quic_recvmsg(sd, s_msg, sizeof(s_msg), &r, 0);
+	if (ret == -1) {
+		printf("send %d %d\n", ret, errno);
+		return 1;
+	}
+	printf("recv %d %d %s\n", ret, r.stream_id, s_msg);
 
 	sleep(2);
 	close(sd);

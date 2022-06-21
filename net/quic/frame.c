@@ -411,14 +411,61 @@ static int quic_frame_handshake_done_create(struct quic_sock *qs)
 static int quic_frame_hs_fin_crypto_create(struct quic_sock *qs)
 {
 	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_HANDSHAKE];
+	u32 f_len, clen = 0, c_len, v_len, t_len;
 	u8 cf[QUIC_HKDF_HASHLEN], *p, *tmp;
-	u32 f_len;
+	struct quic_cert *c;
 	int err;
 
+	t_len = 36;
 	p = f->v + f->len;
 	p = quic_put_varint(p, QUIC_FRAME_CRYPTO);
 	p = quic_put_varint(p, 0x00);
-	p = quic_put_varint(p, 36);
+
+	if (!qs->crypt.hs_buf[QUIC_H_CREQ].v) {
+		p = quic_put_varint(p, t_len);
+		goto fin;
+	}
+
+	for (c = qs->crypt.certs; c; c = c->next)
+		clen += (2 + c->raw.len + 3);
+
+	c_len = 4 + clen + 4;
+	v_len = 4 + (2 + 2 + 256);
+	t_len += c_len + v_len;
+	p = quic_put_varint(p, t_len);
+
+	tmp = p;
+	p = quic_put_pkt_num(p, QUIC_MT_CERTIFICATE, 1);
+	p = quic_put_pkt_num(p, clen + 4, 3);
+	p = quic_put_pkt_num(p, 0, 1);
+	p = quic_put_pkt_num(p, clen, 3);
+
+	for (c = qs->crypt.certs; c; c = c->next) {
+		p = quic_put_pkt_num(p, c->raw.len, 3);
+		p = quic_put_pkt_data(p, c->raw.v, c->raw.len);
+		p = quic_put_pkt_num(p, 0, 2);
+	}
+
+	qs->crypt.hs_buf[QUIC_H_CCERT].len = (u32)(p - tmp);
+	qs->crypt.hs_buf[QUIC_H_CCERT].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CCERT].len);
+	if (!qs->crypt.hs_buf[QUIC_H_CCERT].v)
+		return -ENOMEM;
+
+	err = quic_crypto_certvfy_sign(qs);
+	if (err)
+		return err;
+	tmp = p;
+	p = quic_put_pkt_num(p, QUIC_MT_CERTIFICATE_VERIFY, 1);
+	p = quic_put_pkt_num(p, 2 + 2 + qs->crypt.sig.len, 3);
+	p = quic_put_pkt_num(p, QUIC_SAE_rsa_pss_rsae_sha256, 2);
+	p = quic_put_pkt_num(p, qs->crypt.sig.len, 2);
+	p = quic_put_pkt_data(p, qs->crypt.sig.v, qs->crypt.sig.len);
+	qs->crypt.hs_buf[QUIC_H_CCVFY].len = (u32)(p - tmp);
+	qs->crypt.hs_buf[QUIC_H_CCVFY].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CCVFY].len);
+	if (!qs->crypt.hs_buf[QUIC_H_CCVFY].v)
+		return -ENOMEM;
+
+fin:
 	err = quic_crypto_client_finished_create(qs, cf);
 	if (err)
 		return err;
@@ -433,7 +480,7 @@ static int quic_frame_hs_fin_crypto_create(struct quic_sock *qs)
 	err = quic_crypto_rms_key_install(qs);
 	if (err)
 		return err;
-	f_len = 39;
+	f_len = t_len + 2 + quic_put_varint_len(t_len);
 	f->len += f_len;
 	pr_debug("client crypto finished frame len: %u\n", f_len);
 
@@ -443,8 +490,8 @@ static int quic_frame_hs_fin_crypto_create(struct quic_sock *qs)
 static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 {
 	struct quic_vlen *f = &qs->frame.f[QUIC_PKT_HANDSHAKE];
+	u32 f_len, m_len, p_len, clen = 0, cr_len = 0, t_len;
 	struct quic_param *pm = &qs->params.local;
-	u32 f_len, m_len, p_len, clen = 0, t_len;
 	u32 e_len, c_len, v_len, fin_len, i = 1;
 	u8 *p, *tmp, sf[QUIC_HKDF_HASHLEN];
 	struct quic_cert *c;
@@ -460,12 +507,15 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	fin_len = 4 + QUIC_HKDF_HASHLEN;
 	t_len = e_len + fin_len;
 	if (!qs->crypt.psks) {
+		if (qs->crypt.cert_req)
+			cr_len = 4 + 11;
+
 		for (c = qs->crypt.certs; c; c = c->next)
 			clen += (2 + c->raw.len + 3);
 
 		c_len = 4 + clen + 4;
 		v_len = 4 + (2 + 2 + 256);
-		t_len += c_len + v_len;
+		t_len += c_len + v_len + cr_len;
 	}
 
 	m_len = t_len;
@@ -526,6 +576,25 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	if (qs->crypt.psks)
 		goto fin;
 
+	if (qs->crypt.cert_req) {
+		tmp = p;
+		p = quic_put_pkt_num(p, QUIC_MT_CERTIFICATE_REQUEST, 1);
+		p = quic_put_pkt_num(p, 11, 3);
+		p = quic_put_pkt_num(p, 0, 1);
+		p = quic_put_pkt_num(p, 8, 2);
+
+		p = quic_put_pkt_num(p, QUIC_EXT_signature_algorithms, 2);
+		p = quic_put_pkt_num(p, 4, 2);
+		p = quic_put_pkt_num(p, 2, 2);
+		p = quic_put_pkt_num(p, QUIC_SAE_rsa_pss_rsae_sha256, 2);
+
+		qs->crypt.hs_buf[QUIC_H_CREQ].len = (u32)(p - tmp);
+		qs->crypt.hs_buf[QUIC_H_CREQ].v =
+			quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CREQ].len);
+		if (!qs->crypt.hs_buf[QUIC_H_CREQ].v)
+			return -ENOMEM;
+	}
+
 	tmp = p;
 	p = quic_put_pkt_num(p, QUIC_MT_CERTIFICATE, 1);
 	p = quic_put_pkt_num(p, clen + 4, 3);
@@ -538,16 +607,12 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 		p = quic_put_pkt_num(p, 0, 2);
 	}
 
-	qs->crypt.hs_buf[QUIC_H_CERT].len = (u32)(p - tmp);
-	qs->crypt.hs_buf[QUIC_H_CERT].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CERT].len);
-	if (!qs->crypt.hs_buf[QUIC_H_CERT].v)
+	qs->crypt.hs_buf[QUIC_H_SCERT].len = (u32)(p - tmp);
+	qs->crypt.hs_buf[QUIC_H_SCERT].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_SCERT].len);
+	if (!qs->crypt.hs_buf[QUIC_H_SCERT].v)
 		return -ENOMEM;
 
-	err = quic_crypto_server_certvfy_sign(qs);
-	if (err)
-		return err;
-	/* self-check */
-	err = quic_crypto_server_certvfy_verify(qs);
+	err = quic_crypto_certvfy_sign(qs);
 	if (err)
 		return err;
 	tmp = p;
@@ -556,9 +621,9 @@ static int quic_frame_hs_crypto_create(struct quic_sock *qs)
 	p = quic_put_pkt_num(p, QUIC_SAE_rsa_pss_rsae_sha256, 2);
 	p = quic_put_pkt_num(p, qs->crypt.sig.len, 2);
 	p = quic_put_pkt_data(p, qs->crypt.sig.v, qs->crypt.sig.len);
-	qs->crypt.hs_buf[QUIC_H_CVFY].len = (u32)(p - tmp);
-	qs->crypt.hs_buf[QUIC_H_CVFY].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_CVFY].len);
-	if (!qs->crypt.hs_buf[QUIC_H_CVFY].v)
+	qs->crypt.hs_buf[QUIC_H_SCVFY].len = (u32)(p - tmp);
+	qs->crypt.hs_buf[QUIC_H_SCVFY].v = quic_mem_dup(tmp, qs->crypt.hs_buf[QUIC_H_SCVFY].len);
+	if (!qs->crypt.hs_buf[QUIC_H_SCVFY].v)
 		return -ENOMEM;
 
 fin:
@@ -631,7 +696,7 @@ static int quic_frame_ticket_crypto_create(struct quic_sock *qs)
 
 	f_len = len + 3;
 	f->len += f_len;
-	pr_debug("client crypto finished frame len: %u\n", f_len);
+	pr_debug("new ticket crypto frame len: %u\n", f_len);
 
 	return 0;
 }

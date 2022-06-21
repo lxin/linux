@@ -19,9 +19,6 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
-#define IPPROTO_QUIC 144
-#define SOL_QUIC 144
-
 struct quic_sndinfo {
 	uint32_t stream_id;
 };
@@ -35,73 +32,10 @@ enum quic_cmsg_type {
 	QUIC_RCVINFO,
 };
 
-struct quic_scc {
-	uint32_t start;
-	uint32_t cnt;
-	uint32_t cur;
-};
+#define IPPROTO_QUIC	144
+#define SOL_QUIC	144
 
-struct quic_idv {
-	uint32_t id;
-	uint32_t value;
-};
-
-enum quic_evt_type {
-	QUIC_EVT_CIDS,		/* NEW, DEL, CUR */
-	QUIC_EVT_STREAMS,	/* RESET, STOP, MAX, BLOCKED */
-	QUIC_EVT_ADDRESS,	/* NEW */
-	QUIC_EVT_MAX,
-};
-
-enum quic_evt_stms_type {
-	QUIC_EVT_STREAMS_RESET,
-	QUIC_EVT_STREAMS_STOP,
-	QUIC_EVT_STREAMS_MAX,
-	QUIC_EVT_STREAMS_BLOCKED,
-};
-
-enum quic_evt_cids_type {
-	QUIC_EVT_CIDS_NEW,
-	QUIC_EVT_CIDS_DEL,
-	QUIC_EVT_CIDS_CUR,
-};
-
-enum quic_evt_addr_type {
-	QUIC_EVT_ADDRESS_NEW,
-};
-
-struct quic_evt_msg {
-	uint8_t evt_type;
-	uint8_t sub_type;
-	uint32_t value[3];
-};
-
-/* certificate and private key */
-#define QUIC_SOCKOPT_CERT		0
-#define QUIC_SOCKOPT_PKEY		1
-
-/* connection id related */
-#define QUIC_SOCKOPT_NEW_SCID		2
-#define QUIC_SOCKOPT_DEL_DCID		3
-#define QUIC_SOCKOPT_CUR_SCID		4
-#define QUIC_SOCKOPT_CUR_DCID		5
-#define QUIC_SOCKOPT_ALL_SCID		6
-#define QUIC_SOCKOPT_ALL_DCID		7
-
-/* connection migration related */
-#define QUIC_SOCKOPT_CUR_SADDR		8
-
-/* stream operation related */
-#define QUIC_SOCKOPT_RESET_STREAM	9
-#define QUIC_SOCKOPT_STOP_SENDING	10
-#define QUIC_SOCKOPT_STREAM_STATE	11
-#define QUIC_SOCKOPT_MAX_STREAMS	12
-
-/* event */
-#define QUIC_SOCKOPT_EVENT		13
-#define QUIC_SOCKOPT_EVENTS		14
-
-#define MSG_NOTIFICATION		0x8000
+#define QUIC_SOCKOPT_CERT_REQUEST       22
 
 int quic_recvmsg(int s, void *msg, size_t len, struct quic_rcvinfo *rinfo, int *msg_flags)
 {
@@ -215,12 +149,11 @@ int get_pkey(char **buf)
 #define MSG_LEN	1999
 int main(void)
 {
-	int sd, ret, buf_len, ad, addr_len, sid, len, cid;
 	char s_msg[MSG_LEN + 1], c_msg[MSG_LEN + 1];
+	int sd, ret, buf_len, ad, addr_len;
 	struct sockaddr_in s_addr, c_addr;
 	struct quic_rcvinfo r;
-	struct quic_idv idv;
-	char *buf;
+	char *buf, v;
 
 	sd = socket(AF_INET, SOCK_STREAM, IPPROTO_QUIC);
 
@@ -234,6 +167,15 @@ int main(void)
 	}
 	if (listen(sd, 3)) {
 		printf("Unable to listen\n");
+		return -1;
+	}
+
+
+	v = 1;
+	buf = &v;
+	buf_len = 1;
+	if (setsockopt(sd, SOL_QUIC, QUIC_SOCKOPT_CERT_REQUEST, buf, buf_len) < 0) {
+		printf("Unable to setsockopt cert request %d\n", errno);
 		return -1;
 	}
 
@@ -258,39 +200,21 @@ int main(void)
 	}
 
 	sleep(1);
-	c_addr.sin_family = AF_INET;
-	c_addr.sin_port = htons(3333);
-	c_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-	len = sizeof(c_addr);
-	ret = setsockopt(ad, SOL_QUIC, QUIC_SOCKOPT_CUR_SADDR, &c_addr, len);
-	if (ret < 0) {
-		printf("setsockopt %u %u\n", ret, errno);
-		return 1;
-	}
-
-	cid = 0;
-	len = sizeof(cid);
-	ret = setsockopt(ad, SOL_QUIC, QUIC_SOCKOPT_NEW_SCID, &cid, len);
-	if (ret < 0) {
-		printf("setsockopt %u %u\n", ret, errno);
-		return 1;
-	}
-
-	sid = 1;
-	len = sizeof(sid);
-	ret = setsockopt(ad, SOL_QUIC, QUIC_SOCKOPT_RESET_STREAM, &sid, len);
-	if (ret < 0) {
-		printf("setsockopt %u %u\n", ret, errno);
+	memset(s_msg, 's', sizeof(s_msg) - 1);
+	ret = quic_sendmsg(ad, s_msg, strlen(s_msg), 0, 3);
+	if (ret == -1) {
+		printf("send %d %d\n", ret, errno);
 		return 1;
 	}
 
 	sleep(1);
-	memset(s_msg, 's', sizeof(s_msg) - 1);
-	ret = quic_sendmsg(ad, s_msg, strlen(s_msg), MSG_EOR, 5);
+	memset(c_msg, 0, sizeof(c_msg));
+	ret = quic_recvmsg(ad, c_msg, sizeof(c_msg), &r, 0);
 	if (ret == -1) {
 		printf("send %d %d\n", ret, errno);
 		return 1;
 	}
+	printf("recv %d %d %s\n", ret, r.stream_id, c_msg);
 
 	memset(c_msg, 0, sizeof(c_msg));
 	ret = quic_recvmsg(ad, c_msg, sizeof(c_msg), &r, 0);
@@ -298,16 +222,9 @@ int main(void)
 		printf("send %d %d\n", ret, errno);
 		return 1;
 	}
-	printf("data recv %d %d %s\n", ret, r.stream_id, c_msg);
-	memset(c_msg, 0, sizeof(c_msg));
-	ret = quic_recvmsg(ad, c_msg, sizeof(c_msg), &r, 0);
-	if (ret == -1) {
-		printf("send %d %d\n", ret, errno);
-		return 1;
-	}
-	printf("data recv %d %d %s\n", ret, r.stream_id, c_msg);
+	printf("recv %d %d %s\n", ret, r.stream_id, c_msg);
 
-	sleep(5);
+	sleep(2);
 	close(ad);
 	close(sd);
 	return 0;

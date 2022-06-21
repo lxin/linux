@@ -148,12 +148,12 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 
 		t_srt = tx_srt;
 		r_srt = rx_srt;
-		if (qs->state < QUIC_CS_CLOSING) {
-			tlabel = "client in";
-			rlabel = "server in";
-		} else {
+		if (qs->crypt.is_serv) {
 			rlabel = "client in";
 			tlabel = "server in";
+		} else {
+			tlabel = "client in";
+			rlabel = "server in";
 		}
 		level = "initial";
 	} else if (type == QUIC_PKT_0RTT) {
@@ -190,16 +190,16 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 		rx_iv = qs->crypt.l2_rx_iv;
 		rx_hp_key = qs->crypt.l2_rx_hp_key;
 
-		if (qs->state < QUIC_CS_CLOSING) {
-			t_srt = qs->crypt.ch_secret;
-			r_srt = qs->crypt.sh_secret;
-			tlabel = "c hs traffic";
-			rlabel = "s hs traffic";
-		} else {
+		if (qs->crypt.is_serv) {
 			r_srt = qs->crypt.ch_secret;
 			t_srt = qs->crypt.sh_secret;
 			rlabel = "c hs traffic";
 			tlabel = "s hs traffic";
+		} else {
+			t_srt = qs->crypt.ch_secret;
+			r_srt = qs->crypt.sh_secret;
+			tlabel = "c hs traffic";
+			rlabel = "s hs traffic";
 		}
 		level = "handshake";
 	} else if (type == QUIC_PKT_SHORT) {
@@ -217,12 +217,12 @@ static int quic_crypto_keys_create(struct quic_sock *qs, u8 type)
 
 		t_srt = qs->crypt.tapp_secret;
 		r_srt = qs->crypt.rapp_secret;
-		if (qs->state < QUIC_CS_CLOSING) {
-			tlabel = "c ap traffic";
-			rlabel = "s ap traffic";
-		} else {
+		if (qs->crypt.is_serv) {
 			rlabel = "c ap traffic";
 			tlabel = "s ap traffic";
+		} else {
+			tlabel = "c ap traffic";
+			rlabel = "s ap traffic";
 		}
 		level = "application";
 	}
@@ -725,9 +725,9 @@ err:
 }
 
 /* exported */
-int quic_crypto_server_cert_verify(struct quic_sock *qs)
+int quic_crypto_cert_verify(struct quic_sock *qs)
 {
-	struct quic_cert *certs = qs->crypt.certs, *p, *x, *ca;
+	struct quic_cert *certs = qs->crypt.rcerts, *p, *x, *ca;
 	struct public_key_signature *sig;
 	struct asymmetric_key_id *auth;
 	int err = 0;
@@ -785,87 +785,52 @@ found:
 		x = p;
 	}
 
-	pr_debug("server cert verified %d\n", err);
+	pr_debug("cert verified %d, is_serv: %d\n", err, qs->crypt.is_serv);
 	return err;
 }
 
 /* exported */
 #define TLS13_TBS_START_SIZE		64
 #define TLS13_TBS_PREAMBLE_SIZE		(TLS13_TBS_START_SIZE + 33 + 1)
-int quic_crypto_server_certvfy_verify(struct quic_sock *qs)
+int quic_crypto_certvfy_sign(struct quic_sock *qs)
 {
 	u8 tls13tbs[TLS13_TBS_PREAMBLE_SIZE + 64], digest[QUIC_HASHLEN];
-	u8 KEY_LABEL[] = "TLS 1.3, server CertificateVerify";
-	struct x509_certificate *x = qs->crypt.certs->cert;
-	struct public_key_signature _s, *s = &_s;
-	struct quic_vlen v;
-	u8 *p = tls13tbs;
-	int err;
-
-	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CERT + 1, qs->crypt.hash6);
-	if (err)
-		return err;
-	pr_debug("hash6: %32phN\n", qs->crypt.hash6);
-
-	memset(p, 32, TLS13_TBS_START_SIZE);
-	memcpy(p + TLS13_TBS_START_SIZE, KEY_LABEL, sizeof(KEY_LABEL));
-	memcpy(p + TLS13_TBS_PREAMBLE_SIZE, qs->crypt.hash6, QUIC_HASHLEN);
-	v.v = p;
-	v.len = 130;
-	err = quic_crypto_hash(qs, &v, 1, digest);
-	if (err)
-		return err;
-	pr_debug("digest: %32phN\n", digest);
-
-	s->s = qs->crypt.sig.v;
-	s->s_size = qs->crypt.sig.len;
-	s->digest = digest;
-	s->digest_size = QUIC_HASHLEN;
-	s->data = p;
-	s->data_size = 130;
-	s->encoding = "pss";
-	s->pkey_algo = "rsa";
-	s->hash_algo = "sha256";
-	s->mgf = "mgf1";
-	s->mgf_hash_algo = "sha256";
-	s->salt_length = 32;
-	s->trailer_field = 0xbc;
-
-	err = quic_crypto_signature_verify(qs, x->pub, s);
-	pr_debug("certvfy verified %d\n", err);
-
-	return err;
-}
-
-int quic_crypto_server_certvfy_sign(struct quic_sock *qs)
-{
-	u8 tls13tbs[TLS13_TBS_PREAMBLE_SIZE + 64], digest[QUIC_HASHLEN];
-	u8 KEY_LABEL[] = "TLS 1.3, server CertificateVerify";
 	struct public_key_signature _s, *s = &_s;
 	struct public_key _pkey, *pkey = &_pkey;
+	u8 *p = tls13tbs, *label, *hash;
 	struct quic_vlen v;
-	u8 *p = tls13tbs;
 	int err;
+
+	if (qs->crypt.is_serv) {
+		label = "TLS 1.3, server CertificateVerify";
+		err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_SCERT + 1, qs->crypt.hash6);
+		if (err)
+			return err;
+		pr_debug("hash6: %32phN\n", qs->crypt.hash6);
+		hash = qs->crypt.hash6;
+	} else {
+		label = "TLS 1.3, client CertificateVerify";
+		err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CCERT + 1, qs->crypt.hash8);
+		if (err)
+			return err;
+		pr_debug("hash8: %32phN\n", qs->crypt.hash8);
+		hash = qs->crypt.hash8;
+	}
 
 	memset(pkey, 0, sizeof(_pkey));
 	pkey->key = qs->crypt.pkey.v;
 	pkey->keylen = qs->crypt.pkey.len;
 	pkey->key_is_private = true;
 
-	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CERT + 1, qs->crypt.hash6);
-	if (err)
-		return err;
-	pr_debug("hash6: %32phN\n", qs->crypt.hash6);
-
 	memset(p, 32, TLS13_TBS_START_SIZE);
-	memcpy(p + TLS13_TBS_START_SIZE, KEY_LABEL, sizeof(KEY_LABEL));
-	memcpy(p + TLS13_TBS_PREAMBLE_SIZE, qs->crypt.hash6, QUIC_HASHLEN);
+	memcpy(p + TLS13_TBS_START_SIZE, label, strlen(label) + 1);
+	memcpy(p + TLS13_TBS_PREAMBLE_SIZE, hash, QUIC_HASHLEN);
 	v.v = p;
 	v.len = 130;
 	err = quic_crypto_hash(qs, &v, 1, digest);
 	if (err)
 		return err;
-	pr_debug("digest: %32phN\n", digest);
+	pr_debug("server digest: %32phN\n", digest);
 
 	qs->crypt.sig.len = 256;
 	qs->crypt.sig.v = kzalloc(qs->crypt.sig.len, GFP_ATOMIC);
@@ -888,7 +853,63 @@ int quic_crypto_server_certvfy_sign(struct quic_sock *qs)
 	s->trailer_field = 0xbc;
 
 	err = quic_crypto_signature_sign(qs, pkey, s);
-	pr_debug("certvfy signed %d\n", err);
+	pr_debug("certvfy signed %d, is_serv: %d\n", err, qs->crypt.is_serv);
+
+	return err;
+}
+
+/* exported */
+int quic_crypto_certvfy_verify(struct quic_sock *qs)
+{
+	u8 tls13tbs[TLS13_TBS_PREAMBLE_SIZE + 64], digest[QUIC_HASHLEN];
+	struct x509_certificate *x = qs->crypt.rcerts->cert;
+	struct public_key_signature _s, *s = &_s;
+	u8 *p = tls13tbs, *label, *hash;
+	struct quic_vlen v;
+	int err;
+
+	if (qs->crypt.is_serv) {
+		label = "TLS 1.3, client CertificateVerify";
+		err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CCERT + 1, qs->crypt.hash8);
+		if (err)
+			return err;
+		pr_debug("hash8: %32phN\n", qs->crypt.hash8);
+		hash = qs->crypt.hash8;
+	} else {
+		label = "TLS 1.3, server CertificateVerify";
+		err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_SCERT + 1, qs->crypt.hash6);
+		if (err)
+			return err;
+		pr_debug("hash6: %32phN\n", qs->crypt.hash6);
+		hash = qs->crypt.hash6;
+	}
+
+	memset(p, 32, TLS13_TBS_START_SIZE);
+	memcpy(p + TLS13_TBS_START_SIZE, label, strlen(label) + 1);
+	memcpy(p + TLS13_TBS_PREAMBLE_SIZE, hash, QUIC_HASHLEN);
+	v.v = p;
+	v.len = 130;
+	err = quic_crypto_hash(qs, &v, 1, digest);
+	if (err)
+		return err;
+	pr_debug("client digest: %32phN\n", digest);
+
+	s->s = qs->crypt.sig.v;
+	s->s_size = qs->crypt.sig.len;
+	s->digest = digest;
+	s->digest_size = QUIC_HASHLEN;
+	s->data = p;
+	s->data_size = 130;
+	s->encoding = "pss";
+	s->pkey_algo = "rsa";
+	s->hash_algo = "sha256";
+	s->mgf = "mgf1";
+	s->mgf_hash_algo = "sha256";
+	s->salt_length = 32;
+	s->trailer_field = 0xbc;
+
+	err = quic_crypto_signature_verify(qs, x->pub, s);
+	pr_debug("certvfy verified %d, is_serv %d\n", err, qs->crypt.is_serv);
 
 	return err;
 }
@@ -907,7 +928,7 @@ int quic_crypto_server_finished_create(struct quic_sock *qs, u8 *sf)
 		return err;
 	pr_debug("fks: %32phN\n", fks);
 
-	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CVFY + 1, qs->crypt.hash7);
+	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_SCVFY + 1, qs->crypt.hash7);
 	if (err)
 		return err;
 	pr_debug("hash7: %32phN\n", qs->crypt.hash7);
@@ -993,7 +1014,9 @@ int quic_crypto_client_finished_create(struct quic_sock *qs, u8 *cf)
 		return err;
 	pr_debug("fkc: %32phN\n", fkc);
 
-	memcpy(qs->crypt.hash9, qs->crypt.hash3, QUIC_HKDF_HASHLEN);
+	err = quic_crypto_hash(qs, qs->crypt.hs_buf, QUIC_H_CCVFY + 1, qs->crypt.hash9);
+	if (err)
+		return err;
 	err = quic_crypto_hkdf_extract(qs, fkc, QUIC_HKDF_HASHLEN, qs->crypt.hash9,
 				       QUIC_HKDF_HASHLEN, cf);
 	if (err)
@@ -1109,15 +1132,9 @@ int quic_crypto_initial_keys_install(struct quic_sock *qs)
 	err = quic_crypto_generate_ecdh_keys(qs);
 	if (err)
 		return err;
-	if (qs->state < QUIC_CS_CLOSING) {
-		cid = qs->cids.dcid.list;
-		dcid = cid->id;
-		dcid_len = cid->len;
-	} else {
-		cid = qs->cids.scid.list;
-		dcid = cid->id;
-		dcid_len = cid->len;
-	}
+	cid = qs->crypt.is_serv ? qs->cids.scid.list : qs->cids.dcid.list; /* TODO */
+	dcid = cid->id;
+	dcid_len = cid->len;
 
 	err = quic_crypto_hkdf_extract(qs, salt, salt_len, dcid,
 				       dcid_len, qs->crypt.init_secret);
@@ -1501,6 +1518,7 @@ void quic_crypt_free(struct quic_sock *qs)
 	int i;
 
 	quic_cert_free(qs->crypt.certs);
+	quic_cert_free(qs->crypt.rcerts);
 	quic_cert_free(qs->crypt.ca);
 	kfree(qs->crypt.pkey.v);
 	kfree(qs->crypt.sig.v);

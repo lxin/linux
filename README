@@ -20,7 +20,7 @@ supported are:
   Signature Algorithm: rsa_pss_rsae_sha256(0x0804)
   AEAD: TLS_AES_128_GCM_SHA256(0x1301)
 
-Certificates can be set on server side only (most common case).
+Certificates can be set on both client and server sides.
 
 It is mostly to add files:
 
@@ -94,6 +94,12 @@ How to Use It
     # cd tools/testing/selftests/net/quic/
     # sh server_token.sh
     # sh client_token.sh
+
+  or for client certificate example test by:
+
+    # cd tools/testing/selftests/net/quic/
+    # sh server_ccert.sh
+    # sh client_ccert.sh
 
   and it can also interact with ngtcp2, after building ngtcp2:
 
