@@ -100,7 +100,7 @@ static void quic_path_validation_timeout(struct timer_list *t)
 		goto out;
 	}
 
-	pr_info("cur path is not reachable and move back to old one\n");
+	pr_info("[QUIC] cur path is not reachable and move back to old one\n");
 
 	qs->path.dest.cur = !qs->path.dest.cur;
 	sk_dst_reset(&qs->inet.sk);
@@ -152,6 +152,9 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 	struct sock *sk = &qs->inet.sk;
 	struct inet_sock *ninet = inet_sk(nsk);
 	struct inet_sock *inet = inet_sk(sk);
+	struct tls_vec vec;
+	int err, t;
+
 
 	nsk->sk_type = sk->sk_type;
 	nsk->sk_bound_dev_if = sk->sk_bound_dev_if;
@@ -186,30 +189,18 @@ static int quic_copy_sock(struct quic_sock *nqs, struct quic_sock *qs)
 	memcpy(quic_saddr_cur(nqs), quic_saddr_cur(qs), qs->af->addr_len);
 	nqs->path.src.usk[0] = quic_us_get(qs->path.src.usk[0]);
 	nqs->path.src.usk[1] = quic_us_get(qs->path.src.usk[1]);
-	if (qs->crypt.certs) {
-		struct quic_cert *c, *p, *tmp, *certs = NULL;
-
-		for (p = qs->crypt.certs; p; p = p->next) {
-			c = quic_cert_create(p->raw.v, p->raw.len);
-			if (!c) {
-				nqs->crypt.certs = certs;
-				return -ENOMEM;
-			}
-			if (certs)
-				tmp->next = c;
-			else
-				certs = c;
-			tmp = c;
+	for (t = TLS_T_PKEY; t <= TLS_T_CRTS; t++) {
+		err = tls_handshake_get(qs->tls, t, tls_vec(&vec, NULL, 0));
+		if (err)
+			return err;
+		if (vec.len) {
+			err = tls_handshake_set(nqs->tls, t, &vec);
+			if (err)
+				return err;
 		}
-		nqs->crypt.certs = certs;
+		if (t == TLS_T_CRTS || t == TLS_T_PSK)
+			kfree(vec.data);
 	}
-	if (qs->crypt.pkey.len) {
-		nqs->crypt.pkey.v = quic_mem_dup(qs->crypt.pkey.v, qs->crypt.pkey.len);
-		if (!nqs->crypt.pkey.v)
-			return -ENOMEM;
-		nqs->crypt.pkey.len = qs->crypt.pkey.len;
-	}
-	nqs->crypt.cert_req = qs->crypt.cert_req;
 	return 0;
 }
 
@@ -226,6 +217,7 @@ static struct quic_sock *quic_sock_create(struct quic_sock *qs)
 
 	sock_init_data(NULL, nsk);
 	nqs = quic_sk(nsk);
+	nqs->crypt.is_serv = true;
 	if (nsk->sk_prot->init(nsk)) {
 		sk_common_release(nsk);
 		return NULL;
@@ -234,9 +226,7 @@ static struct quic_sock *quic_sock_create(struct quic_sock *qs)
 		sk_common_release(nsk);
 		return NULL;
 	}
-	nqs->state = QUIC_CS_SERVER_INITIAL;
 	nqs->lsk = qs;
-	nqs->crypt.is_serv = true;
 
 	return nqs;
 }
@@ -268,6 +258,7 @@ struct quic_sock *quic_lsk_process(struct quic_sock *qs, struct sk_buff *skb)
 		quic_sock_free(nqs);
 		return NULL;
 	}
+	nqs->state = QUIC_CS_SERVER_INITIAL;
 	return nqs;
 }
 
@@ -281,7 +272,7 @@ void quic_start_rtx_timer(struct quic_sock *qs, u8 restart)
 
 void quic_stop_rtx_timer(struct quic_sock *qs)
 {
-	if (!del_timer(&qs->rtx_timer))
+	if (del_timer(&qs->rtx_timer))
 		sock_put(&qs->inet.sk);
 }
 
@@ -297,7 +288,7 @@ void quic_start_hs_timer(struct quic_sock *qs, u8 restart)
 
 void quic_stop_hs_timer(struct quic_sock *qs)
 {
-	if (!del_timer(&qs->hs_timer))
+	if (del_timer(&qs->hs_timer))
 		sock_put(&qs->inet.sk);
 }
 
@@ -313,7 +304,7 @@ void quic_start_path_timer(struct quic_sock *qs, u8 restart)
 
 void quic_stop_path_timer(struct quic_sock *qs)
 {
-	if (!del_timer(&qs->path_timer))
+	if (del_timer(&qs->path_timer))
 		sock_put(&qs->inet.sk);
 }
 
@@ -332,7 +323,7 @@ void quic_start_ping_timer(struct quic_sock *qs, u8 restart)
 
 void quic_stop_ping_timer(struct quic_sock *qs)
 {
-	if (!del_timer(&qs->ping_timer))
+	if (del_timer(&qs->ping_timer))
 		sock_put(&qs->inet.sk);
 }
 
@@ -366,17 +357,17 @@ int quic_sock_init(struct quic_sock *qs, union quic_addr *a, u8 *dcid, u8 dcid_l
 	timer_setup(&qs->path_timer, quic_path_validation_timeout, 0);
 	timer_setup(&qs->ping_timer, quic_ping_timeout, 0);
 
-	pr_info("quic sock init %p\n", qs);
+	pr_info("[QUIC] quic sock init %p\n", qs);
 	return 0;
 
 frame_err:
-	quic_crypt_free(qs);
+	quic_crypto_free(qs);
 crypt_err:
 	quic_cid_free(qs);
 cid_err:
 	quic_strm_free(qs);
 err:
-	pr_err("quic sock error %d\n", err);
+	pr_err("[QUIC] quic sock error %d\n", err);
 	return err;
 }
 
@@ -394,12 +385,11 @@ void quic_sock_free(struct quic_sock *qs)
 	if (del_timer_sync(&qs->hs_timer))
 		sock_put(&qs->inet.sk);
 
-	pr_info("quic sock free %p\n", qs);
+	pr_info("[QUIC] quic sock free %p\n", qs);
 	quic_send_list_free(qs);
 	quic_receive_list_free(qs);
 
 	quic_cid_free(qs);
 	quic_strm_free(qs);
-	quic_crypt_free(qs);
 	quic_frame_free(qs);
 }

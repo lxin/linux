@@ -121,9 +121,10 @@ void quic_sysctl_net_unregister(struct net *net)
 
 static struct ctl_table_header *quic_sysctl_header;
 
-void quic_sysctl_register(void)
+int quic_sysctl_register(void)
 {
 	quic_sysctl_header = register_net_sysctl(&init_net, "net/quic", quic_table);
+	return quic_sysctl_header ? 0 : -ENOMEM;
 }
 
 void quic_sysctl_unregister(void)

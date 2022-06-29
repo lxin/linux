@@ -249,6 +249,13 @@ int main(void)
 		printf("send %d %d\n", ret, errno);
 		return 1;
 	}
+	memset(s_msg, 0, sizeof(s_msg));
+	ret = quic_recvmsg(ad, s_msg, sizeof(s_msg), &r, &msg_flags);
+	if (ret == -1) {
+		printf("recv %d %d\n", ret, errno);
+		goto err;
+	}
+	printf("recv %d %d %s\n", ret, r.stream_id, s_msg);
 
 err:
 	sleep(2);

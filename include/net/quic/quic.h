@@ -17,6 +17,8 @@
 #include <linux/workqueue.h>
 #include <linux/swap.h>
 #include <linux/quic.h>
+#include <net/quic/tls_hs.h>
+#include <linux/scatterlist.h>
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
 #include <crypto/aead.h>
@@ -180,50 +182,11 @@ struct quic_token {
 	__u8 len;
 };
 
-#define QUIC_MSG_legacy_version	0x0303
-#define QUIC_AES_128_GCM_SHA256	0x1301
-#define QUIC_ECDHE_secp256r1	0x0017
-#define QUIC_SAE_rsa_pss_rsae_sha256	0x0804
-#define QUIC_MSG_version	0x0304
-
-#define QUIC_HKDF_HMAC_ALG	"hmac(sha256)"
-#define QUIC_HKDF_HASHLEN	SHA256_DIGEST_SIZE
-
 #define QUIC_KEYLEN		16
 #define QUIC_IVLEN		12
 #define QUIC_TAGLEN		16
-#define QUIC_ECDHLEN		32
-#define QUIC_HASHLEN		32
-
-#define QUIC_MIN_INIT_LEN	1200
-
 #define QUIC_HASH_SIZE		64
-
-struct quic_initial_param {
-	u32 type; /* 1 */
-	u32 length; /* u24, len of client hello below */
-	u16 version;
-	u8 random[32];
-	u8 session_id_len;
-	u8 *session_id; /* var */
-	u16 cipher_suites_len;
-	u8 *cipher_suites; /* var */
-	u8 compression_methods_len;
-	u8 *compression_methods; /* var */
-	u16 extensions_len;
-};
-
-#define QUIC_H_CH	0
-#define QUIC_H_SH	1
-#define QUIC_H_EE	2
-#define QUIC_H_CREQ	3
-#define QUIC_H_SCERT	4
-#define QUIC_H_SCVFY	5
-#define QUIC_H_SFIN	6
-#define QUIC_H_CCERT	7
-#define QUIC_H_CCVFY	8
-#define QUIC_H_CFIN	9
-#define QUIC_H_COUNT	10
+#define QUIC_MIN_INIT_LEN	1200
 
 enum quic_pkt_type {
 	QUIC_PKT_INITIAL = 0x0,
@@ -236,52 +199,7 @@ enum quic_pkt_type {
 
 #define QUIC_FR_NR	(QUIC_PKT_VERSION_NEGOTIATION + 1 + 2)
 
-struct quic_psk {
-	struct quic_psk *next;
-	u32 psk_sent_at;
-	u32 psk_expire;
-	struct quic_vlen pskid;
-	struct quic_vlen nonce;
-	struct quic_vlen mskey;
-};
-
-struct quic_cert {
-	struct quic_cert *next;
-	struct x509_certificate *cert;
-	struct quic_vlen raw;
-};
-
 struct quic_crypt {
-	struct crypto_shash *sha_tfm;
-	u8 init_secret[QUIC_HKDF_HASHLEN];
-	u8 ch_secret[QUIC_HKDF_HASHLEN];
-	u8 sh_secret[QUIC_HKDF_HASHLEN];
-	u8 es_secret[QUIC_HKDF_HASHLEN];
-	u8 hs_secret[QUIC_HKDF_HASHLEN];
-	u8 ms_secret[QUIC_HKDF_HASHLEN];
-	u8 rms_secret[QUIC_HKDF_HASHLEN];
-	u8 fbk_secret[QUIC_HKDF_HASHLEN];
-	u8 dhe_secret[QUIC_HKDF_HASHLEN];
-	u8 tapp_secret[QUIC_HKDF_HASHLEN];
-	u8 rapp_secret[QUIC_HKDF_HASHLEN];
-	u8 binder_secret[QUIC_HKDF_HASHLEN];
-
-	struct crypto_shash *hash_tfm;
-	u8 hash0[QUIC_HASHLEN];
-	u8 hash1[QUIC_HASHLEN];
-	u8 hash2[QUIC_HASHLEN];
-	u8 hash3[QUIC_HASHLEN];
-	u8 hash4[QUIC_HASHLEN];
-	u8 hash5[QUIC_HASHLEN];
-	u8 hash6[QUIC_HASHLEN];
-	u8 hash7[QUIC_HASHLEN];
-	u8 hash8[QUIC_HASHLEN];
-	u8 hash9[QUIC_HASHLEN];
-
-	struct crypto_kpp *kpp_tfm;
-	u8 ecdh_x[QUIC_ECDHLEN];
-	u8 ecdh_y[QUIC_ECDHLEN];
-
 	struct crypto_aead *aead_tfm;
 	u8 tx_key[QUIC_KEYLEN];
 	u8 tx_iv[QUIC_IVLEN];
@@ -310,20 +228,8 @@ struct quic_crypt {
 	u8 l3_tx_hp_key[QUIC_KEYLEN];
 	u8 l3_rx_hp_key[QUIC_KEYLEN];
 
-	struct quic_initial_param hello;
-	struct quic_vlen hs_buf[QUIC_H_COUNT];
-
-	struct crypto_akcipher *akc_tfm;
-	struct quic_cert *certs;
-	struct quic_cert *rcerts;
-	struct quic_cert *ca;
-	struct quic_vlen pkey;
-	struct quic_vlen sig;
-
-	struct quic_psk *psks;
 	u8 key_phase:1,
 	   key_pending:1,
-	   cert_req:1,
 	   is_serv:1;
 };
 
@@ -424,6 +330,7 @@ struct quic_sock {
 
 	struct quic_sock	*lsk; /* listening sock */
 	struct quic_af		*af;  /* inet4 or inet6 */
+	struct tls_hs		*tls; /* tls handshake */
 
 	struct quic_params	params;
 	enum quic_state		state;
@@ -446,14 +353,6 @@ struct quic_sock {
 struct quic_frame_ops {
 	int (*frame_create)(struct quic_sock *qs);
 	int (*frame_process)(struct quic_sock *qs, u8 **ptr, u8 type, u32 left);
-};
-
-struct quic_msg_ops {
-	int (*msg_process)(struct quic_sock *qs, u8 *p, u32 len);
-};
-
-struct quic_ext_ops {
-	int (*ext_process)(struct quic_sock *qs, u8 *p, u32 len);
 };
 
 struct quic_af {
@@ -503,60 +402,6 @@ enum {
 	QUIC_FRAME_DATAGRAM_LEN = 0x31,
 };
 
-#define QUIC_MT_HELLO_REQUEST                   0
-#define QUIC_MT_CLIENT_HELLO                    1
-#define QUIC_MT_SERVER_HELLO                    2
-#define QUIC_MT_NEWSESSION_TICKET               4
-#define QUIC_MT_END_OF_EARLY_DATA               5
-#define QUIC_MT_ENCRYPTED_EXTENSIONS            8
-#define QUIC_MT_CERTIFICATE                     11
-#define QUIC_MT_SERVER_KEY_EXCHANGE             12
-#define QUIC_MT_CERTIFICATE_REQUEST             13
-#define QUIC_MT_SERVER_DONE                     14
-#define QUIC_MT_CERTIFICATE_VERIFY              15
-#define QUIC_MT_CLIENT_KEY_EXCHANGE             16
-#define QUIC_MT_FINISHED                        20
-#define QUIC_MT_CERTIFICATE_URL                 21
-#define QUIC_MT_CERTIFICATE_STATUS              22
-#define QUIC_MT_SUPPLEMENTAL_DATA               23
-#define QUIC_MT_KEY_UPDATE                      24
-#define QUIC_MT_MAX	QUIC_MT_KEY_UPDATE
-
-#define QUIC_EXT_server_name                 0
-#define QUIC_EXT_max_fragment_length         1
-#define QUIC_EXT_client_certificate_url      2
-#define QUIC_EXT_trusted_ca_keys             3
-#define QUIC_EXT_truncated_hmac              4
-#define QUIC_EXT_status_request              5
-#define QUIC_EXT_user_mapping                6
-#define QUIC_EXT_client_authz                7
-#define QUIC_EXT_server_authz                8
-#define QUIC_EXT_cert_type                   9
-#define QUIC_EXT_supported_groups            10
-#define QUIC_EXT_ec_point_formats            11
-#define QUIC_EXT_srp                         12
-#define QUIC_EXT_signature_algorithms        13
-#define QUIC_EXT_use_srtp                    14
-#define QUIC_EXT_heartbeat                   15
-#define QUIC_EXT_application_layer_protocol_negotiation 16
-#define QUIC_EXT_signed_certificate_timestamp 18
-#define QUIC_EXT_padding                     21
-#define QUIC_EXT_encrypt_then_mac            22
-#define QUIC_EXT_extended_master_secret      23
-#define QUIC_EXT_session_ticket              35
-#define QUIC_EXT_psk                         41
-#define QUIC_EXT_early_data                  42
-#define QUIC_EXT_supported_versions          43
-#define QUIC_EXT_cookie                      44
-#define QUIC_EXT_psk_kex_modes               45
-#define QUIC_EXT_certificate_authorities     47
-#define QUIC_EXT_post_handshake_auth         49
-#define QUIC_EXT_signature_algorithms_cert   50
-#define QUIC_EXT_key_share                   51
-#define QUIC_EXT_MAX	QUIC_EXT_key_share
-#define QUIC_EXT_quic_transport_parameters_draft	0xffa5
-#define QUIC_EXT_quic_transport_parameters		0x0039
-
 #define QUIC_PARAM_original_destination_connection_id	0x00
 #define QUIC_PARAM_max_udp_payload_size			0x03
 #define QUIC_PARAM_initial_max_data			0x04
@@ -596,46 +441,68 @@ union quic_num_x {
 	u8	num_b[8];
 };
 
-static inline u32 quic_get_varint_len(const u8 *p)
-{
-	return (u32)(1u << (*p >> 6));
-}
-
-static inline u64 quic_get_varint(u32 *plen, const u8 *p)
+static inline u64 quic_get_varint(u8 **pp, u32 *plen)
 {
 	union quic_num_x num;
+	u8 *p = *pp;
+	u64 v;
 
 	*plen = (u32)(1u << (*p >> 6));
 
 	switch (*plen) {
 	case 1:
-		return *p;
+		v = *p;
+		break;
 	case 2:
 		memcpy(&num.num_16, p, 2);
 		num.num_b[0] &= 0x3f;
-		return ntohs(num.num_16);
+		v = ntohs(num.num_16);
+		break;
 	case 4:
 		memcpy(&num.num_32, p, 4);
 		num.num_b[0] &= 0x3f;
-		return ntohl(num.num_32);
+		v = ntohl(num.num_32);
+		break;
 	case 8:
 		memcpy(&num.num_64, p, 8);
 		num.num_b[0] &= 0x3f;
-		return be64_to_cpu(num.num_64);
+		v = be64_to_cpu(num.num_64);
+		break;
 	}
 
-	return 0;
-}
-
-static inline u64 quic_get_varint_next(u8 **p, u32 *plen)
-{
-	u64 v = quic_get_varint(plen, *p);
-
-	*p += *plen;
+	*pp = p + *plen;
 	return v;
 }
 
-static inline u32 quic_put_varint_len(u64 n)
+static inline u32 quic_get_fixint(u8 **pp, u32 len)
+{
+	union quic_num_x num;
+	u8 *p = *pp;
+	u32 v;
+
+	num.num_32 = 0;
+	switch (len) {
+	case 1:
+		v = *p;
+		break;
+	case 2:
+		memcpy(&num.num_16, p, 2);
+		v = ntohs(num.num_16);
+		break;
+	case 3:
+		memcpy(((u8 *)&num.num_32) + 1, p, 3);
+		v = ntohl(num.num_32);
+		break;
+	case 4:
+		memcpy(&num.num_32, p, 4);
+		v = ntohl(num.num_32);
+		break;
+	}
+	*pp = p + len;
+	return v;
+}
+
+static inline u32 quic_varint_len(u64 n)
 {
 	if (n < 64)
 		return 1;
@@ -646,11 +513,11 @@ static inline u32 quic_put_varint_len(u64 n)
 	return 8;
 }
 
-static inline u32 quic_put_varint_lens(u32 n)
+static inline u32 quic_varint_lens(u32 n)
 {
-	u32 len = quic_put_varint_len(n);
+	u32 len = quic_varint_len(n);
 
-	return len + quic_put_varint_len(len);
+	return len + quic_varint_len(len);
 }
 
 static inline u8 *quic_put_varint(u8 *p, u64 n)
@@ -680,47 +547,7 @@ static inline u8 *quic_put_varint(u8 *p, u64 n)
 	return p + 8;
 }
 
-static inline u32 quic_get_pkt_num(const u8 *p, u32 pkt_numlen)
-{
-	union quic_num_x num;
-
-	num.num_32 = 0;
-	switch (pkt_numlen) {
-	case 1:
-		return *p;
-	case 2:
-		memcpy(&num.num_16, p, 2);
-		return ntohs(num.num_16);
-	case 3:
-		memcpy(((u8 *)&num.num_32) + 1, p, 3);
-		return ntohl(num.num_32);
-	case 4:
-		memcpy(&num.num_32, p, 4);
-		return ntohl(num.num_32);
-	}
-	return 0;
-}
-
-static inline u32 quic_get_fixint_next(u8 **p, u32 len)
-{
-	u32 v = quic_get_pkt_num(*p, len);
-
-	*p += len;
-	return v;
-}
-
-static inline u32 quic_put_pkt_numlen(u32 n)
-{
-	if (n > 0xffffff)
-		return 4;
-	if (n > 0xffff)
-		return 3;
-	if (n > 0xff)
-		return 2;
-	return 1;
-}
-
-static inline u8 *quic_put_pkt_num(u8 *p, u64 pkt_num, u8 len)
+static inline u8 *quic_put_fixint(u8 *p, u64 pkt_num, u8 len)
 {
 	union quic_num_x num;
 
@@ -747,13 +574,24 @@ static inline u8 *quic_put_pkt_num(u8 *p, u64 pkt_num, u8 len)
 	}
 }
 
-static inline u8 *quic_put_pkt_data(u8 *p, u8 *data, u32 len)
+static inline u8 *quic_put_data(u8 *p, u8 *data, u32 len)
 {
 	if (!len)
 		return p;
 
 	memcpy(p, data, len);
 	return p + len;
+}
+
+static inline u32 quic_fixint_len(u32 n)
+{
+	if (n > 0xffffff)
+		return 4;
+	if (n > 0xffff)
+		return 3;
+	if (n > 0xff)
+		return 2;
+	return 1;
 }
 
 struct quic_rcv_cb {
@@ -931,7 +769,7 @@ static inline int quic_stream_wspace(struct sock *sk)
 
 static inline bool quic_is_serv(struct quic_sock *qs)
 {
-	return qs->state > QUIC_CS_CLOSING;
+	return qs->crypt.is_serv;
 }
 
 static inline union quic_addr *quic_saddr_cur(struct quic_sock *qs)
@@ -949,8 +787,6 @@ static inline union quic_addr *quic_daddr_cur(struct quic_sock *qs)
 /* proto.c */
 struct quic_af *quic_af_get(sa_family_t family);
 int quic_dst_mss_check(struct quic_sock *qs, int hdr);
-void quic_cert_free(struct quic_cert *cert);
-struct quic_cert *quic_cert_create(u8 *cert, int len);
 
 /* udp.c */
 struct quic_usock *quic_udp_sock_lookup(struct quic_sock *qs, union quic_addr *a);
@@ -994,29 +830,14 @@ void quic_frame_free(struct quic_sock *qs);
 int quic_crypto_load(void);
 int quic_crypto_init(struct quic_sock *qs);
 void quic_crypto_free(struct quic_sock *qs);
-void quic_crypt_free(struct quic_sock *qs);
 int quic_crypto_encrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type);
 int quic_crypto_decrypt(struct quic_sock *qs, struct sk_buff *skb, u8 type);
+int quic_crypto_retry_encrypt(struct quic_sock *qs, u8 *in, u32 len, u8 *out);
 int quic_crypto_initial_keys_install(struct quic_sock *qs);
-int quic_crypto_compute_ecdh_secret(struct quic_sock *qs, u8 *x, u8 *y);
+int quic_crypto_early_keys_install(struct quic_sock *qs);
 int quic_crypto_handshake_keys_install(struct quic_sock *qs);
 int quic_crypto_application_keys_install(struct quic_sock *qs);
-int quic_crypto_early_keys_prepare(struct quic_sock *qs);
-int quic_crypto_early_keys_install(struct quic_sock *qs);
-int quic_crypto_early_binder_create(struct quic_sock *qs, u8 *v, u32 len);
-int quic_crypto_rms_key_install(struct quic_sock *qs);
-int quic_crypto_cert_verify(struct quic_sock *qs);
-int quic_crypto_certvfy_sign(struct quic_sock *qs);
-int quic_crypto_certvfy_verify(struct quic_sock *qs);
-int quic_crypto_server_finished_create(struct quic_sock *qs, u8 *sf);
-int quic_crypto_server_finished_verify(struct quic_sock *qs);
-int quic_crypto_client_finished_create(struct quic_sock *qs, u8 *cf);
-int quic_crypto_client_finished_verify(struct quic_sock *qs);
-int quic_crypto_psk_create(struct quic_sock *qs, u8 *pskid, u32 pskid_len,
-			   u8 *nonce, u32 nonce_len, u8 *mskey, u32 mskey_len);
-void quic_crypto_psk_free(struct quic_sock *qs);
 int quic_crypto_key_update(struct quic_sock *qs);
-int quic_crypto_retry_encrypt(struct quic_sock *qs, u8 *in, u32 len, u8 *out);
 
 /* input.c */
 int quic_rcv(struct sk_buff *skb);
@@ -1048,14 +869,8 @@ int quic_cid_init(struct quic_sock *qs, u8 *dcid, int dcid_len, u8 *scid, int sc
 void quic_cid_free(struct quic_sock *qs);
 void quic_cid_destroy(struct quic_cid *cid);
 
-/* msg.c */
-int quic_msg_process(struct quic_sock *qs, u8 *p, u32 hs_offset, u32 hs_len, u32 left);
-
-/* exts.c */
-int quic_exts_process(struct quic_sock *qs, u8 *p);
-
 /* sysctl.c */
-void quic_sysctl_register(void);
+int quic_sysctl_register(void);
 void quic_sysctl_unregister(void);
 int quic_sysctl_net_register(struct net *net);
 void quic_sysctl_net_unregister(struct net *net);

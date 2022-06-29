@@ -195,6 +195,7 @@ int main(void)
 		printf("send %d %d\n", ret, errno);
 		return 1;
 	}
+	printf("send %d\n", ret);
 
 	sleep(1);
 	memset(c_msg, 0, sizeof(c_msg));

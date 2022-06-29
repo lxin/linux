@@ -26,7 +26,7 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 	if (type == QUIC_PKT_INITIAL) {
 		if (qs->frame.stream.msg)
 			early_len = len + 1 + 1 + iov_iter_count(qs->frame.stream.msg);
-		len += quic_put_varint_len(qs->token.len) + qs->token.len;
+		len += quic_varint_len(qs->token.len) + qs->token.len;
 		qs->packet.pn = qs->packet.in_tx_pn++;
 		if (!qs->packet.pn)
 			minlen = (early_len >= 1178) ? 0 : (1178 - early_len);
@@ -40,7 +40,7 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 		qs->packet.pn = qs->packet.hs_tx_pn++;
 	}
 	if (!rv) {
-		plen = quic_put_pkt_numlen(qs->packet.pn) - 1;
+		plen = quic_fixint_len(qs->packet.pn) - 1;
 		qs->packet.pn_len = plen + 1;
 		dlen = qs->packet.pn_len + f->len;
 		if (dlen < minlen) {
@@ -48,12 +48,10 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 			padlen = dlen - (qs->packet.pn_len + f->len);
 		}
 		rlen = dlen + QUIC_TAGLEN;
-		len += quic_put_varint_len(rlen);
+		len += quic_varint_len(rlen);
 		qs->packet.pn_off = len;
 		len += dlen;
 	}
-	pr_debug("remain len: %d, pn_offset: %d, pn_len: %d, len: %d\n",
-		 rlen, qs->packet.pn_off, qs->packet.pn_len, len);
 
 	skb = alloc_skb(len + QUIC_TAGLEN + hlen, GFP_ATOMIC);
 	if (!skb)
@@ -71,38 +69,37 @@ static struct sk_buff *quic_packet_long_create(struct quic_sock *qs, u8 type)
 	p++;
 
 	/* Version */
-	p = quic_put_pkt_num(p, (type == QUIC_PKT_VERSION_NEGOTIATION ? 0 : QUIC_VERSION_V1), 4);
+	p = quic_put_fixint(p, (type == QUIC_PKT_VERSION_NEGOTIATION ? 0 : QUIC_VERSION_V1), 4);
 
 	/* Various Length Header: dcid and scid */
 	p = quic_put_varint(p, qs->cids.dcid.cur->len);
-	p = quic_put_pkt_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
+	p = quic_put_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
 	p = quic_put_varint(p, qs->cids.scid.cur->len);
-	p = quic_put_pkt_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
+	p = quic_put_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
 
 	/* Various Length Header: token */
 	if (type == QUIC_PKT_INITIAL) {
 		p = quic_put_varint(p, qs->token.len);
-		p = quic_put_pkt_data(p, qs->token.token, qs->token.len);
+		p = quic_put_data(p, qs->token.token, qs->token.len);
 	}
 
 	/* Various Length Header: length */
 	if (!rv) {
 		p = quic_put_varint(p, rlen);
 		/* Various Length Header: packet number */
-		p = quic_put_pkt_num(p, qs->packet.pn, qs->packet.pn_len);
+		p = quic_put_fixint(p, qs->packet.pn, qs->packet.pn_len);
 		QUIC_SND_CB(skb)->pn = qs->packet.pn;
 	}
 	QUIC_SND_CB(skb)->type = type;
 	QUIC_SND_CB(skb)->has_strm = qs->frame.has_strm;
 
 	/* CRYPTO Frame */
-	p = quic_put_pkt_data(p, f->v, f->len);
+	p = quic_put_data(p, f->v, f->len);
 	if (type == QUIC_PKT_0RTT) /* keep the early data len for rtx */
 		qs->packet.early_len = f->len;
 	f->len = 0;
 	if (padlen)
 		memset(p, 0, padlen); /* padding frame */
-	pr_debug("packet type: %d, len %d, pad len %d\n", type, skb->len, padlen);
 
 	return skb;
 }
@@ -119,7 +116,7 @@ static struct sk_buff *quic_packet_short_create(struct quic_sock *qs)
 	len = 1 + qs->cids.dcid.cur->len;
 
 	qs->packet.pn = qs->packet.ad_tx_pn++;
-	plen = quic_put_pkt_numlen(qs->packet.pn) - 1;
+	plen = quic_fixint_len(qs->packet.pn) - 1;
 	qs->packet.pn_len = plen + 1;
 	dlen = qs->packet.pn_len + f->len;
 	if (dlen < minlen) {
@@ -147,21 +144,20 @@ static struct sk_buff *quic_packet_short_create(struct quic_sock *qs)
 	p++;
 
 	/* Various Length Header: dcid */
-	p = quic_put_pkt_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
+	p = quic_put_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
 
 	/* Various Length Header: packet number */
-	p = quic_put_pkt_num(p, qs->packet.pn, qs->packet.pn_len);
+	p = quic_put_fixint(p, qs->packet.pn, qs->packet.pn_len);
 	QUIC_SND_CB(skb)->pn = qs->packet.pn;
 	QUIC_SND_CB(skb)->type = QUIC_PKT_SHORT;
 	QUIC_SND_CB(skb)->has_strm = qs->frame.has_strm;
 	QUIC_SND_CB(skb)->strm_off = qs->frame.stream.off;
 
 	/* Frame */
-	p = quic_put_pkt_data(p, f->v, f->len);
+	p = quic_put_data(p, f->v, f->len);
 	f->len = 0;
 	if (padlen)
 		memset(p, 0, padlen); /* padding frame */
-	pr_debug("packet type: %d, len %d, pad len %d\n", QUIC_PKT_SHORT, skb->len, padlen);
 
 	return skb;
 }
@@ -194,7 +190,7 @@ static int quic_packet_long_process(struct quic_sock *qs, struct sk_buff *skb, u
 		p += len;
 	}
 
-	pd_len = quic_get_varint_next(&p, &len);
+	pd_len = quic_get_varint(&p, &len);
 	qs->packet.pn_off = p - (u8 *)hdr;
 	qs->packet.pd_len = pd_len;
 	err = quic_crypto_decrypt(qs, skb, hdr->type);
@@ -277,18 +273,18 @@ static int quic_packet_retry_create(struct quic_sock *qs, struct sk_buff *skb)
 
 	p = pseudo;
 	p = quic_put_varint(p, qs->cids.scid.cur->len);
-	p = quic_put_pkt_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
+	p = quic_put_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
 	*p = 0;
 	hdr = (struct quic_lhdr *)p;
 	hdr->form = 1;
 	hdr->fixed = 1;
 	hdr->type = QUIC_PKT_RETRY;
 	p++;
-	p = quic_put_pkt_num(p, QUIC_VERSION_V1, 4);
+	p = quic_put_fixint(p, QUIC_VERSION_V1, 4);
 	p = quic_put_varint(p, qs->cids.dcid.cur->len);
-	p = quic_put_pkt_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
+	p = quic_put_data(p, qs->cids.dcid.cur->id, qs->cids.dcid.cur->len);
 	p = quic_put_varint(p, qs->cids.scid.cur->len);
-	p = quic_put_pkt_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
+	p = quic_put_data(p, qs->cids.scid.cur->id, qs->cids.scid.cur->len);
 	len = (u32)(p - pseudo);
 	memset(tag, 0, 16);
 	err = quic_crypto_retry_encrypt(qs, pseudo, len, tag);
@@ -296,12 +292,11 @@ static int quic_packet_retry_create(struct quic_sock *qs, struct sk_buff *skb)
 		pr_warn("retry encrypt err %d\n", err);
 		return err;
 	}
-	pr_debug("retry encrypt tag: %16phN\n", tag);
 
 	p = f->v;
 	p = quic_put_varint(p, 8);
-	p = quic_put_pkt_data(p, qs->lsk->token.token, 8);
-	p = quic_put_pkt_data(p, tag, 16);
+	p = quic_put_data(p, qs->lsk->token.token, 8);
+	p = quic_put_data(p, tag, 16);
 	f->len += 16;
 	qs->packet.f = f;
 	skb = quic_packet_do_create(qs, type);
@@ -419,7 +414,7 @@ static int quic_packet_ver_process(struct quic_sock *qs, struct sk_buff *skb)
 	pr_warn("unsupported version %x\n", ver);
 	f = &qs->frame.f[type];
 	f->len = 4;
-	quic_put_pkt_num(f->v, QUIC_VERSION_V1, 4);
+	quic_put_fixint(f->v, QUIC_VERSION_V1, 4);
 	qs->packet.f = f;
 	skb = quic_packet_do_create(qs, type);
 	if (skb) {
@@ -430,7 +425,6 @@ static int quic_packet_ver_process(struct quic_sock *qs, struct sk_buff *skb)
 	return -EPROTONOSUPPORT;
 }
 
-/* exported */
 int quic_packet_pre_process(struct quic_sock *qs, struct sk_buff *skb)
 {
 	int err;
@@ -446,7 +440,6 @@ int quic_packet_pre_process(struct quic_sock *qs, struct sk_buff *skb)
 	return err;
 }
 
-/* exported */
 int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb)
 {
 	struct quic_lhdr *hdr = quic_lhdr(skb);
@@ -498,7 +491,6 @@ int quic_packet_process(struct quic_sock *qs, struct sk_buff *skb)
 	return 0;
 }
 
-/* exported */
 struct sk_buff *quic_packet_create(struct quic_sock *qs, u8 type, u8 ftype)
 {
 	struct sk_buff *skb;

@@ -43,7 +43,7 @@ static struct quic_usock *quic_udp_sock_create(struct quic_sock *qs, union quic_
 
 	qs->af->udp_conf_init(&udp_conf, a);
 	if (udp_sock_create(net, &udp_conf, &sock)) {
-		pr_err("Failed to create UDP sock for QUIC\n");
+		pr_err("[QUIC] Failed to create UDP sock for QUIC\n");
 		kfree(usk);
 		return NULL;
 	}

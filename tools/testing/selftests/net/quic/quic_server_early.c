@@ -74,6 +74,7 @@ struct quic_evt_msg {
 	uint8_t evt_type;
 	uint8_t sub_type;
 	uint32_t value[3];
+	uint8_t data[];
 };
 
 /* certificate and private key */
@@ -303,6 +304,12 @@ int main(void)
 		es = (struct quic_evt_msg *)s_msg;
 		printf("notification type %u, %u: %u, %u, %u\n",
 		       es->evt_type, es->sub_type, es->value[0], es->value[1], es->value[2]);
+		buf_len = es->value[0];
+		buf = es->data;
+		if (setsockopt(sd, SOL_QUIC, QUIC_SOCKOPT_LOAD_TICKET, buf, buf_len) < 0) {
+			printf("Unable to setsockopt PSK %d\n", errno);
+			return -1;
+		}
 	}
 next:
 	close(ad);

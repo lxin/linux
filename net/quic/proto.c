@@ -216,11 +216,14 @@ static int quic_init_sock(struct sock *sk)
 	sk_sockets_allocated_inc(sk);
 	sock_prot_inuse_add(net, sk->sk_prot, 1);
 	local_bh_enable();
-	return 0;
+
+	return tls_handshake_create(&qs->tls, quic_is_serv(qs), GFP_ATOMIC);
 }
 
 static void quic_destroy_sock(struct sock *sk)
 {
+	tls_handshake_destroy(quic_sk(sk)->tls);
+
 	local_bh_disable();
 	sk_sockets_allocated_dec(sk);
 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
@@ -274,7 +277,7 @@ static int quic_wait_for_connect(struct sock *sk, long timeo)
 			goto out;
 		}
 
-		if (quic_sk(sk)->state != QUIC_CS_CLIENT_WAIT_HANDSHAKE)
+		if (quic_sk(sk)->state != QUIC_CS_CLIENT_INITIAL)
 			goto out;
 
 		exit = 0;
@@ -300,9 +303,8 @@ static int quic_do_connect(struct sock *sk)
 	err = quic_crypto_initial_keys_install(qs);
 	if (err)
 		goto init_err;
-	err = quic_crypto_early_keys_prepare(qs);
-	if (err)
-		goto init_err;
+
+	qs->state = QUIC_CS_CLIENT_INITIAL;
 	skb = quic_packet_create(qs, QUIC_PKT_INITIAL, QUIC_FRAME_CRYPTO);
 	if (!skb) {
 		err = -ENOMEM;
@@ -326,8 +328,6 @@ static int quic_do_connect(struct sock *sk)
 		goto route_err;
 
 	quic_start_hs_timer(qs, 0);
-
-	qs->state = QUIC_CS_CLIENT_WAIT_HANDSHAKE;
 	inet_sk_set_state(sk, QUIC_SS_CONNECTING);
 	return 0;
 
@@ -356,7 +356,6 @@ static int quic_inet_connect(struct socket *sock, struct sockaddr *addr, int add
 		err = -EINVAL;
 		goto out;
 	}
-	qs->state = QUIC_CS_CLIENT_INITIAL;
 	err = quic_sock_init(qs, quic_a(addr), dcid, 8, scid, 8);
 	if (err)
 		return err;
@@ -390,8 +389,7 @@ static void quic_close(struct sock *sk, long timeout)
 			spin_unlock(&head->lock);
 		}
 	} else if (sk->sk_state != QUIC_SS_CLOSED) {
-		pr_info("close %u %u\n", READ_ONCE(sk->sk_sndbuf),
-			READ_ONCE(sk->sk_wmem_queued));
+		pr_debug("[QUIC] close %u %u\n", READ_ONCE(sk->sk_sndbuf), READ_ONCE(sk->sk_wmem_queued));
 		if (qs->state != QUIC_CS_CLOSING) {
 			qs->frame.close.err = QUIC_ERROR_NO_ERROR;
 			skb = quic_packet_create(qs, QUIC_PKT_SHORT,
@@ -482,7 +480,7 @@ int quic_dst_mss_check(struct quic_sock *qs, int hdr)
 	} else if (hdr == 2) {
 		mss -= (sizeof(struct quic_lhdr) + 4);
 		mss -= (1 + qs->cids.dcid.cur->len + 1 + qs->cids.scid.cur->len);
-		mss -= (quic_put_varint_len(qs->token.len) + qs->token.len);
+		mss -= (quic_varint_len(qs->token.len) + qs->token.len);
 		mss -= (4 + 2);
 		mss -= QUIC_TAGLEN;
 	} else if (hdr == 3) {
@@ -564,7 +562,7 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 	}
 
 	if (qs->state == QUIC_CS_CLOSED) { /* 0RTT data */
-		if (!qs->crypt.psks || !msg->msg_name) {
+		if (!msg->msg_name) {
 			err = -EPIPE;
 			goto err;
 		}
@@ -578,7 +576,6 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 			err = -EINVAL;
 			goto err;
 		}
-		qs->state = QUIC_CS_CLIENT_INITIAL;
 		err = quic_sock_init(qs, quic_a(addr), dcid, 8, scid, 8);
 		if (err)
 			goto err;
@@ -723,7 +720,7 @@ static int quic_read_flow_control(struct quic_sock *qs, struct sk_buff *skb)
 	    pkt->rcv_max - pkt->rcv_len > pkt_rwnd / 8) {
 		qs->frame.max.limit = pkt_rwnd + pkt->rcv_len;
 		qs->packet.rcv_max = pkt_rwnd + pkt->rcv_len;
-		pr_debug("flow control set max data %u, %llu\n", pkt_rwnd, pkt->rcv_len);
+		pr_debug("[QUIC] flow control set max data %u, %llu\n", pkt_rwnd, pkt->rcv_len);
 		skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_MAX_DATA);
 		if (skb)
 			quic_write_queue_enqueue(qs, skb);
@@ -734,7 +731,7 @@ static int quic_read_flow_control(struct quic_sock *qs, struct sk_buff *skb)
 		qs->frame.stream.sid = sid;
 		qs->frame.max.limit = strm_rwnd + strm->rcv_len;
 		strm->rcv_max = strm_rwnd + strm->rcv_len;
-		pr_debug("flow control set max stream data %u, %llu\n", strm_rwnd, strm->rcv_len);
+		pr_debug("[QUIC] flow control set max stream data %u, %llu\n", strm_rwnd, strm->rcv_len);
 		skb = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_MAX_STREAM_DATA);
 		if (skb)
 			quic_write_queue_enqueue(qs, skb);
@@ -926,136 +923,12 @@ int quic_inet_getname(struct socket *sock, struct sockaddr *uaddr, int peer)
 	return quic_sk(sock->sk)->af->get_name(sock, uaddr, peer);
 }
 
-struct quic_cert *quic_cert_create(u8 *cert, int len)
-{
-	struct x509_certificate *x;
-	struct quic_cert *c;
-
-	c = kzalloc(sizeof(*c), GFP_ATOMIC);
-	if (!c)
-		return NULL;
-
-	c->raw.len = len;
-	c->raw.v = quic_mem_dup(cert, len);
-	if (!c->raw.v) {
-		kfree(c);
-		return NULL;
-	}
-
-	x = x509_cert_parse(c->raw.v, len);
-	if (IS_ERR(x)) {
-		quic_cert_free(c);
-		return NULL;
-	}
-	c->cert = x;
-
-	return c;
-}
-
-void quic_cert_free(struct quic_cert *cert)
-{
-	struct quic_cert *c, *p = cert;
-
-	while (p) {
-		c = p->next;
-		kfree(p->cert);
-		kfree(p->raw.v);
-		kfree(p);
-		p = c;
-	}
-}
-
-static int quic_setsockopt_root_ca(struct sock *sk, u8 *cert, unsigned int len)
+static int quic_setsockopt_tls_hs(struct sock *sk, u8 *crt, unsigned int len, u8 type)
 {
 	struct quic_sock *qs = quic_sk(sk);
-	struct quic_cert *c;
+	struct tls_vec vec;
 
-	if (!len) {
-		quic_cert_free(qs->crypt.ca);
-		qs->crypt.ca = NULL;
-		return 0;
-	}
-
-	c = quic_cert_create(cert, len);
-	if (!c)
-		return -ENOMEM;
-
-	qs->crypt.ca = c;
-	return 0;
-}
-
-static int quic_setsockopt_cert(struct sock *sk, u8 *cert, unsigned int len)
-{
-	struct quic_sock *qs = quic_sk(sk);
-	struct quic_cert *c, *p;
-
-	if (!len) {
-		quic_cert_free(qs->crypt.certs);
-		qs->crypt.certs = NULL;
-		return 0;
-	}
-
-	c = quic_cert_create(cert, len);
-	if (!c)
-		return -ENOMEM;
-
-	p = qs->crypt.certs;
-	if (p) {
-		for (; p->next; p = p->next)
-			;
-		p->next = c;
-	} else {
-		qs->crypt.certs = c;
-	}
-
-	return 0;
-}
-
-static int quic_setsockopt_cert_chain(struct sock *sk, u8 *cert, unsigned int len)
-{
-	struct quic_cert *c, *certs = NULL, *p = NULL;
-	struct quic_sock *qs = quic_sk(sk);
-	int clen, err = 0;
-
-	while (len > 0) {
-		clen = *((u32 *)cert);
-		cert += 4;
-		len -= 4;
-		c = quic_cert_create(cert, clen);
-		if (!c) {
-			err = -ENOMEM;
-			goto out;
-		}
-
-		cert += clen;
-		len -= clen;
-		if (!certs)
-			certs = c;
-		else
-			p->next = c;
-		p = c;
-	}
-
-out:
-	quic_cert_free(qs->crypt.certs);
-	qs->crypt.certs = certs;
-
-	return 0;
-}
-
-static int quic_setsockopt_pkey(struct sock *sk, u8 *pkey, unsigned int len)
-{
-	struct quic_sock *qs = quic_sk(sk);
-
-	pkey = quic_mem_dup(pkey, len);
-	if (!pkey)
-		return -ENOMEM;
-
-	kfree(qs->crypt.pkey.v);
-	qs->crypt.pkey.v = pkey;
-	qs->crypt.pkey.len = len;
-
-	return 0;
+	return tls_handshake_set(qs->tls, type, tls_vec(&vec, crt, len));
 }
 
 static int quic_setsockopt_cur_cid(struct sock *sk, u32 *cur, unsigned int len, bool is_scid)
@@ -1214,70 +1087,25 @@ static int quic_setsockopt_events(struct sock *sk, u32 *events, unsigned int len
 static int quic_setsockopt_new_ticket(struct sock *sk, u8 *pskid, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
+	struct tls_vec id, vec;
 	struct sk_buff *skb;
-	u8 nonce[8];
 	int err;
 
-	if (len < sizeof(*pskid) || qs->state != QUIC_CS_SERVER_POST_HANDSHAKE ||
-	    qs->crypt.psks)
+	if (qs->state != QUIC_CS_SERVER_POST_HANDSHAKE)
 		return -EINVAL;
 
-	get_random_bytes(nonce, 8);
-	err = quic_crypto_psk_create(qs, pskid, len, nonce, 8,
-				     qs->crypt.rms_secret, QUIC_HKDF_HASHLEN);
+	err = tls_handshake_post(qs->tls, TLS_P_TICKET, tls_vec(&id, pskid, len), &vec);
 	if (err)
 		return err;
-
 	qs->packet.ticket = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_CRYPTO);
-	if (!qs->packet.ticket) {
-		quic_crypto_psk_free(qs);
+	if (!qs->packet.ticket)
 		return -ENOMEM;
-	}
-
 	skb = skb_clone(qs->packet.ticket, GFP_ATOMIC);
 	if (skb) {
 		skb_set_owner_w(skb, sk);
 		qs->af->lower_xmit(qs, skb);
 		quic_start_rtx_timer(qs, 0);
 	}
-
-	return 0;
-}
-
-static int quic_setsockopt_load_ticket(struct sock *sk, u8 *psk, unsigned int len)
-{
-	u32 expire, sent_at, *p = (u32 *)psk;
-	u32 nonce_len, pskid_len, mskey_len;
-	struct quic_sock *qs = quic_sk(sk);
-	u8 *nonce, *pskid, *mskey;
-	struct quic_psk *psks;
-	int err;
-
-	if (len < 20 || qs->state != QUIC_CS_CLOSED || qs->crypt.psks)
-		return -EINVAL;
-
-	pskid_len = *p++;
-	nonce_len = *p++;
-	mskey_len = *p++;
-	sent_at = *p++;
-	expire = *p++;
-
-	psk = (u8 *)p;
-	pskid = psk;
-	nonce = psk + pskid_len;
-	mskey = psk + pskid_len + nonce_len;
-	err = quic_crypto_psk_create(qs, pskid, pskid_len, nonce, nonce_len,
-				     mskey, mskey_len);
-	if (err)
-		return err;
-
-	psks = qs->crypt.psks;
-	psks->psk_sent_at = sent_at + 5000;
-	psks->psk_expire = expire;
-	pr_debug("load ticket %u %u: %8phN(%u), %8phN(%u), %8phN(%u)\n",
-		 psks->psk_sent_at, psks->psk_expire,
-		 psks->pskid.v, psks->pskid.len, psks->nonce.v,
-		 psks->nonce.len, psks->mskey.v, psks->mskey.len);
 
 	return 0;
 }
@@ -1350,11 +1178,13 @@ static int quic_setsockopt_load_token(struct sock *sk, u8 *token, unsigned int l
 
 static int quic_setsockopt_cert_request(struct sock *sk, u8 *v, unsigned int len)
 {
+	struct quic_sock *qs = quic_sk(sk);
+	struct tls_vec vec;
+
 	if (!len)
 		return -EINVAL;
 
-	quic_sk(sk)->crypt.cert_req = !!(*v);
-	return 0;
+	return tls_handshake_set(qs->tls, TLS_T_CRT_REQ, tls_vec(&vec, NULL, !!(*v)));
 }
 
 static int quic_setsockopt_new_cid(struct sock *sk, u32 *cid, unsigned int len)
@@ -1480,16 +1310,16 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 	listen = sk->sk_state == QUIC_SS_LISTENING;
 	switch (optname) {
 	case QUIC_SOCKOPT_CERT:
-		retval = quic_setsockopt_cert(sk, kopt, optlen);
+		retval = quic_setsockopt_tls_hs(sk, kopt, optlen, TLS_T_CRT);
 		break;
 	case QUIC_SOCKOPT_CERT_CHAIN:
-		retval = quic_setsockopt_cert_chain(sk, kopt, optlen);
+		retval = quic_setsockopt_tls_hs(sk, kopt, optlen, TLS_T_CRTS);
 		break;
 	case QUIC_SOCKOPT_ROOT_CA:
-		retval = quic_setsockopt_root_ca(sk, kopt, optlen);
+		retval = quic_setsockopt_tls_hs(sk, kopt, optlen, TLS_T_CA);
 		break;
 	case QUIC_SOCKOPT_PKEY:
-		retval = quic_setsockopt_pkey(sk, kopt, optlen);
+		retval = quic_setsockopt_tls_hs(sk, kopt, optlen, TLS_T_PKEY);
 		break;
 	case QUIC_SOCKOPT_NEW_SCID:
 		retval = quic_setsockopt_new_cid(sk, kopt, optlen);
@@ -1525,7 +1355,7 @@ static int quic_setsockopt(struct sock *sk, int level, int optname,
 		retval = quic_setsockopt_new_ticket(sk, kopt, optlen);
 		break;
 	case QUIC_SOCKOPT_LOAD_TICKET:
-		retval = quic_setsockopt_load_ticket(sk, kopt, optlen);
+		retval = quic_setsockopt_tls_hs(sk, kopt, optlen, TLS_T_PSK);
 		break;
 	case QUIC_SOCKOPT_KEY_UPDATE:
 		retval = quic_setsockopt_key_update(sk, kopt, optlen);
@@ -1549,81 +1379,33 @@ out:
 	return retval;
 }
 
-static int quic_getsockopt_cert(struct sock *sk, int len, char __user *optval,
-				int __user *optlen)
+static int quic_getsockopt_tls_hs(struct sock *sk, int len, char __user *optval,
+				  int __user *optlen, u8 type)
 {
 	struct quic_sock *qs = quic_sk(sk);
-	struct quic_cert *c;
+	struct tls_vec vec = {NULL, 0};
+	int err;
 
-	c = qs->crypt.certs;
-	if (len < c->raw.len)
-		return -EINVAL;
+	err = tls_handshake_get(qs->tls, type, &vec);
+	if (err)
+		goto out;
 
-	len = c->raw.len;
-	if (put_user(len, optlen))
-		return -EFAULT;
-
-	if (len && copy_to_user(optval, c->raw.v, len))
-		return -EFAULT;
-
-	return 0;
-}
-
-static int quic_getsockopt_cert_chain(struct sock *sk, int len, char __user *optval,
-				      int __user *optlen)
-{
-	struct quic_sock *qs = quic_sk(sk);
-	struct quic_cert *c;
-	int clen = 0;
-	u8 *p, *tmp;
-
-	for (c = qs->crypt.certs; c; c = c->next)
-		clen += (4 + c->raw.len);
-
-	if (len < clen)
-		return -EINVAL;
-
-	tmp = kzalloc(clen, GFP_KERNEL);
-	if (!tmp)
-		return -EINVAL;
-	p = tmp;
-	for (c = qs->crypt.certs; c; c = c->next) {
-		*((u32 *)p) = c->raw.len;
-		p += 4;
-		memcpy(p, c->raw.v, c->raw.len);
-		p += c->raw.len;
+	if (len < vec.len) {
+		err = -EINVAL;
+		goto out;
 	}
-	len = clen;
+	len = vec.len;
 	if (put_user(len, optlen)) {
-		kfree(tmp);
-		return -EFAULT;
+		err = -EFAULT;
+		goto out;
 	}
 
-	if (len && copy_to_user(optval, tmp, len)) {
-		kfree(tmp);
-		return -EFAULT;
-	}
+	if (len && copy_to_user(optval, vec.data, len))
+		err = -EFAULT;
 
-	kfree(tmp);
-	return 0;
-}
-
-static int quic_getsockopt_pkey(struct sock *sk, int len, char __user *optval,
-				int __user *optlen)
-{
-	struct quic_sock *qs = quic_sk(sk);
-
-	if (len < qs->crypt.pkey.len)
-		return -EINVAL;
-
-	len = qs->crypt.pkey.len;
-	if (put_user(len, optlen))
-		return -EFAULT;
-
-	if (len && copy_to_user(optval, qs->crypt.pkey.v, len))
-		return -EFAULT;
-
-	return 0;
+out:
+	kfree(vec.data);
+	return err;
 }
 
 static int quic_getsockopt_all_cids(struct sock *sk, int len, char __user *optval,
@@ -1820,14 +1602,17 @@ static int quic_getsockopt(struct sock *sk, int level, int optname,
 	}
 
 	switch (optname) {
+	case QUIC_SOCKOPT_ROOT_CA:
+		retval = quic_getsockopt_tls_hs(sk, len, optval, optlen, TLS_T_CA);
+		break;
 	case QUIC_SOCKOPT_CERT:
-		retval = quic_getsockopt_cert(sk, len, optval, optlen);
+		retval = quic_getsockopt_tls_hs(sk, len, optval, optlen, TLS_T_CRT);
 		break;
 	case QUIC_SOCKOPT_CERT_CHAIN:
-		retval = quic_getsockopt_cert_chain(sk, len, optval, optlen);
+		retval = quic_getsockopt_tls_hs(sk, len, optval, optlen, TLS_T_CRTS);
 		break;
 	case QUIC_SOCKOPT_PKEY:
-		retval = quic_getsockopt_pkey(sk, len, optval, optlen);
+		retval = quic_getsockopt_tls_hs(sk, len, optval, optlen, TLS_T_PKEY);
 		break;
 	case QUIC_SOCKOPT_ALL_SCID:
 		retval = quic_getsockopt_all_cids(sk, len, optval, optlen, true);
@@ -2088,7 +1873,7 @@ static __init int quic_init(void)
 	sysctl_quic_wmem[2] = max(64 * 1024, max_share);
 
 	quic_sysctl_register();
-	pr_info("QUIC init\n");
+	pr_info("[QUIC] init\n");
 	return 0;
 
 err_def_ops:
@@ -2098,7 +1883,7 @@ err_protosw:
 err_percpu_counter:
 	quic_hash_destroy();
 err:
-	pr_err("QUIC init error\n");
+	pr_err("[QUIC] init error\n");
 	return err;
 }
 
@@ -2109,7 +1894,7 @@ static __exit void quic_exit(void)
 	quic_v4_protosw_exit();
 	percpu_counter_destroy(&quic_sockets_allocated);
 	quic_hash_destroy();
-	pr_info("QUIC exit\n");
+	pr_info("[QUIC] exit\n");
 }
 
 module_init(quic_init);

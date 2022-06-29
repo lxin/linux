@@ -19,19 +19,21 @@
 
 struct quic_psk {
 	uint32_t pskid_len; /* 4 */
-	uint32_t nonce_len; /* 8 */
+	uint8_t pskid[4];
 	uint32_t mskey_len; /* 32 */
+	uint8_t mskey[32];
+	uint32_t nonce_len; /* 8 */
+	uint8_t nonce[8];
 	uint32_t psk_sent_at;
 	uint32_t psk_expire;
-	uint8_t pskid[4];
-	uint8_t nonce[8];
-	uint8_t mskey[32];
 };
 
 void print_key(char *str, uint8_t key[], int len)
 {
 	int i;
 
+	if (!len)
+		return;
 	printf("%s: ", str);
 	for (i = 0; i < len; i++)
 		printf("%02x", key[i]);
@@ -58,12 +60,12 @@ int main(int argc, char *argv[])
 
 	if (argc == 4 && strlen(argv[2]) == 8 && strlen(argv[3]) == 64) {
 		psk.psk_sent_at = 0;
-		psk.psk_expire = 5000;
+		psk.psk_expire = 0;
 		psk.pskid_len = 4;
 		copy_key(psk.pskid, argv[2], 8);
-		psk.nonce_len = 8;
 		psk.mskey_len = 32;
 		copy_key(psk.mskey, argv[3], 64);
+		psk.nonce_len = 8; /* changed */
 
 		name = argv[1];
 		fd = open(name, O_WRONLY | O_CREAT, 0644);
@@ -83,10 +85,11 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 		len = read(fd, &psk, sizeof(psk));
-		printf("read file %s len %d\n", name, len);
-		print_key("id", psk.pskid, 4);
-		print_key("nonce", psk.nonce, 8);
-		print_key("master key", psk.mskey, 32);
+		printf("read file %s len %d %d\n", name, len, psk.pskid_len);
+		print_key("id", psk.pskid, psk.pskid_len);
+		print_key("nonce", psk.nonce, psk.nonce_len); /* changed */
+		print_key("master key", psk.mskey, psk.mskey_len);
+		printf("age_add %u lieftime %u\n", psk.psk_sent_at, psk.psk_expire);
 		return 0;
 	}
 

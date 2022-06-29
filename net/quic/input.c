@@ -184,7 +184,7 @@ int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb)
 					p = n;
 					continue;
 				} else if (noff == off) {
-					pr_debug("dup offset\n");
+					pr_debug("[QUIC] dup offset %u\n", off);
 					return -EINVAL; /* dup */
 				}
 			}
@@ -205,7 +205,7 @@ int quic_receive_list_add(struct quic_sock *qs, struct sk_buff *skb)
 
 	__skb_queue_tail(&sk->sk_receive_queue, skb);
 	sk->sk_data_ready(sk);
-	pr_debug("recv stream id: %u, off: %u, len: %u, fin: %u\n", id, off,
+	pr_debug("[QUIC] recv stream id: %u, off: %u, len: %u, fin: %u\n", id, off,
 		 skb->len, QUIC_RCV_CB(skb)->strm_fin);
 	if (QUIC_RCV_CB(skb)->strm_fin) {
 		strm->rcv_state = QUIC_STRM_P_RECVD;
@@ -261,7 +261,7 @@ void quic_receive_list_free(struct quic_sock *qs)
 
 	skb = qs->packet.recv_list;
 	while (skb) {
-		pr_warn("recv list free %u\n", QUIC_RCV_CB(skb)->pn);
+		pr_debug("[QUIC] recv list free %u\n", QUIC_RCV_CB(skb)->pn);
 		tmp = skb;
 		skb = skb->next;
 		kfree_skb(tmp);
@@ -270,7 +270,6 @@ void quic_receive_list_free(struct quic_sock *qs)
 
 	skb = __skb_dequeue(&sk->sk_receive_queue);
 	while (skb) {
-		pr_warn("receive queue free %u\n", QUIC_RCV_CB(skb)->pn);
 		kfree_skb(skb);
 		skb = __skb_dequeue(&sk->sk_receive_queue);
 	}
@@ -302,7 +301,7 @@ int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[])
 	em->value[1] = v[1];
 	em->value[2] = v[2];
 
-	pr_debug("event created %u %u\n", evt_type, sub_type);
+	pr_debug("[QUIC] event created %u %u\n", evt_type, sub_type);
 	__skb_queue_tail(&sk->sk_receive_queue, skb);
 	sk->sk_data_ready(sk);
 	return 0;
@@ -311,16 +310,19 @@ int quic_evt_notify(struct quic_sock *qs, u8 evt_type, u8 sub_type, u32 v[])
 int quic_evt_notify_ticket(struct quic_sock *qs)
 {
 	struct sock *sk = &qs->inet.sk;
+	struct tls_vec vec = {NULL, 0};
 	struct quic_evt_msg *em;
-	struct quic_psk *psk;
 	struct sk_buff *skb;
-	u32 len;
+	u32 len, err;
 
 	if (!(qs->packet.events & (1 << QUIC_EVT_TICKET)))
 		return 0;
 
-	psk = qs->crypt.psks;
-	len = 8 + psk->mskey.len + psk->nonce.len + psk->pskid.len;
+	err = tls_handshake_get(qs->tls, TLS_T_PSK, &vec);
+	if (err)
+		return err;
+
+	len = vec.len;
 	skb = alloc_skb(sizeof(*em) + len, GFP_ATOMIC);
 	if (!skb)
 		return -ENOMEM;
@@ -329,16 +331,11 @@ int quic_evt_notify_ticket(struct quic_sock *qs)
 	em = skb_put(skb, sizeof(*em) + len);
 	em->evt_type = QUIC_EVT_TICKET;
 	em->sub_type = QUIC_EVT_TICKET_NEW;
-	em->value[0] = psk->pskid.len;
-	em->value[1] = psk->nonce.len;
-	em->value[2] = psk->mskey.len;
-	memcpy(em->data, &psk->psk_sent_at, 4);
-	memcpy(em->data + 4, &psk->psk_expire, 4);
-	memcpy(em->data + 8, psk->pskid.v, psk->pskid.len);
-	memcpy(em->data + 8 + psk->pskid.len, psk->nonce.v, psk->nonce.len);
-	memcpy(em->data + 8 + psk->pskid.len + psk->nonce.len, psk->mskey.v, psk->mskey.len);
+	em->value[0] = len;
+	memcpy(em->data, vec.data, len);
 
-	pr_debug("event created %u %u\n", QUIC_EVT_TICKET, QUIC_EVT_TICKET_NEW);
+	kfree(vec.data);
+	pr_debug("[QUIC] event created %u %u\n", QUIC_EVT_TICKET, QUIC_EVT_TICKET_NEW);
 	__skb_queue_tail(&sk->sk_receive_queue, skb);
 	sk->sk_data_ready(sk);
 	return 0;
@@ -364,7 +361,7 @@ int quic_evt_notify_token(struct quic_sock *qs)
 	em->value[0] = qs->token.len;
 	memcpy(em->data, qs->token.token, qs->token.len);
 
-	pr_debug("event created %u %u\n", QUIC_EVT_TOKEN, QUIC_EVT_TOKEN_NEW);
+	pr_debug("[QUIC] event created %u %u\n", QUIC_EVT_TOKEN, QUIC_EVT_TOKEN_NEW);
 	__skb_queue_tail(&sk->sk_receive_queue, skb);
 	sk->sk_data_ready(sk);
 	return 0;

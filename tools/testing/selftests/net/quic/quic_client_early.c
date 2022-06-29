@@ -76,6 +76,7 @@ struct quic_evt_msg {
 	uint8_t evt_type;
 	uint8_t sub_type;
 	uint32_t value[3];
+	uint8_t data[];
 };
 
 /* certificate and private key */
@@ -309,14 +310,15 @@ int main(void)
 			printf("open file %s error %d\n", name, errno);
 			goto out;
 		}
-		len = 20 + es->value[0] + es->value[1] + es->value[2];
-		len = write(fd, es->value, len);
+		len = es->value[0];
+		len = write(fd, es->data, len);
 		printf("write file %s len %d\n", name, len);
 		close(fd);
 
 		break;
 	}
 
+	sleep(2);
 	close(sd);
 	printf("wait for 5 seconds\n");
 	sleep(5);

@@ -78,7 +78,7 @@ void quic_v4_lower_xmit(struct quic_sock *qs, struct sk_buff *skb)
 	__u8 dscp = inet->tos;
 	__be16 df = 0;
 
-	pr_debug("%s: skb: %p len: %d | path: %pI4:%d -> %pI4:%d\n",
+	pr_debug("[QUIC] %s: skb: %p len: %d | path: %pI4:%d -> %pI4:%d\n",
 		 __func__, skb, skb->len,
 		 &s->v4.sin_addr.s_addr, ntohs(s->v4.sin_port),
 		 &d->v4.sin_addr.s_addr, ntohs(d->v4.sin_port));
@@ -102,7 +102,7 @@ void quic_v6_lower_xmit(struct quic_sock *qs, struct sk_buff *skb)
 	struct sock *sk = &qs->inet.sk;
 	struct dst_entry *dst = sk_dst_get(sk);
 
-	pr_debug("%s: skb: %p len: %d | path: %pI6:%d -> %pI6:%d\n",
+	pr_debug("[QUIC] %s: skb: %p len: %d | path: %pI6:%d -> %pI6:%d\n",
 		 __func__, skb, skb->len,
 		 &s->v6.sin6_addr, ntohs(s->v6.sin6_port),
 		 &d->v6.sin6_addr, ntohs(d->v6.sin6_port));
@@ -332,7 +332,7 @@ static void quic_cong_update_rto(struct quic_sock *qs, __u32 rtt)
 	else if (c->rto < msecs_to_jiffies(QUIC_RTO_MIN))
 		c->rto = msecs_to_jiffies(QUIC_RTO_MIN);
 
-	pr_debug("updata rtt:%u, srtt:%u rttvar:%u, rto:%u\n",
+	pr_debug("[QUIC] updata rtt:%u, srtt:%u rttvar:%u, rto:%u\n",
 		 rtt, c->srtt, c->rttvar, c->rto);
 }
 
@@ -372,7 +372,6 @@ void quic_send_queue_check(struct quic_sock *qs, u32 v)
 			QUIC_SND_CB(skb)->rtt_probe = 0;
 			quic_cong_update_rto(qs, rtt);
 		}
-		pr_debug("ACKed by peer %u %u\n", QUIC_SND_CB(skb)->pn, v);
 		kfree_skb(skb);
 		break;
 	}
@@ -384,19 +383,6 @@ void quic_send_queue_check(struct quic_sock *qs, u32 v)
 		if (err) {
 			qs->inet.sk.sk_err = err;
 			pr_warn("notify ticket fails %d\n", err);
-		}
-		if (qs->lsk && qs->crypt.psks) {
-			struct quic_psk *psk = qs->lsk->crypt.psks;
-
-			if (psk) {
-				while (psk->next)
-					psk = psk->next;
-				psk->next = qs->crypt.psks;
-				qs->crypt.psks = NULL;
-			} else {
-				qs->lsk->crypt.psks = qs->crypt.psks;
-				qs->crypt.psks = NULL;
-			}
 		}
 	}
 
