@@ -12,7 +12,7 @@
 #include <linux/err.h>
 #include <linux/oid_registry.h>
 #include <crypto/public_key.h>
-#include <crypto/x509_parser.h>
+#include "x509_parser.h"
 #include "x509.asn1.h"
 #include "x509_akid.asn1.h"
 #include "x509_rsassa.asn1.h"

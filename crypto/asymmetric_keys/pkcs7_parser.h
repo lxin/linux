@@ -7,7 +7,7 @@
 
 #include <linux/oid_registry.h>
 #include <crypto/pkcs7.h>
-#include <crypto/x509_parser.h>
+#include "x509_parser.h"
 
 #define kenter(FMT, ...) \
 	pr_devel("==> %s("FMT")\n", __func__, ##__VA_ARGS__)

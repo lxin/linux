@@ -13,8 +13,8 @@
 #include <keys/asymmetric-parser.h>
 #include <keys/system_keyring.h>
 #include <crypto/hash.h>
-#include <crypto/x509_parser.h>
 #include "asymmetric_keys.h"
+#include "x509_parser.h"
 
 /*
  * Set up the signature parameters in an X.509 certificate.  This involves
