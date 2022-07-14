@@ -8,7 +8,7 @@ menuconfig IP_QUIC
 	depends on INET
 	depends on IPV6 || IPV6=n
 	select NET_UDP_TUNNEL
-	select CRYPTO_RSASSA_PSS
+	select CRYPTO_TLS_HS
 	help
 	  QUIC: A UDP-Based Multiplexed and Secure Transport
 

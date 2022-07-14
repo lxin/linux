@@ -1838,8 +1838,6 @@ static __init int quic_init(void)
 	int err = -ENOMEM;
 	int max_share;
 
-	if (quic_crypto_load())
-		goto err;
 	if (quic_hash_init())
 		goto err;
 	err = percpu_counter_init(&quic_sockets_allocated, 0, GFP_KERNEL);

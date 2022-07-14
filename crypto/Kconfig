@@ -1957,6 +1957,19 @@ config CRYPTO_STATS
 config CRYPTO_HASH_INFO
 	bool
 
+config CRYPTO_TLS_HS
+	tristate "In-kernel TLS 1.3 handshake APIs"
+	select CRYPTO_HMAC
+	select CRYPTO_SHA256
+	select CRYPTO_ECB
+	select CRYPTO_GCM
+	select CRYPTO_ECDH
+	select CRYPTO_RSASSA_PSS
+	help
+	  Provide APIs to help kernel users complete tls 1.3 handshake,
+	  including key exchange, certificate and psk authentications,
+	  key update, and session resumption etc.
+
 source "drivers/crypto/Kconfig"
 source "crypto/asymmetric_keys/Kconfig"
 source "certs/Kconfig"

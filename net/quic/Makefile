@@ -6,4 +6,4 @@
 obj-$(CONFIG_IP_QUIC) += quic.o
 
 quic-y := proto.o packet.o strm.o sock.o cid.o udp.o crypto.o \
-	  input.o output.o frame.o sysctl.o tls_hs.o
+	  input.o output.o frame.o sysctl.o

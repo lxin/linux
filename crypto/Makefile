@@ -204,6 +204,8 @@ obj-$(CONFIG_CRYPTO_HASH_INFO) += hash_info.o
 crypto_simd-y := simd.o
 obj-$(CONFIG_CRYPTO_SIMD) += crypto_simd.o
 
+obj-$(CONFIG_CRYPTO_TLS_HS) += tls_hs.o
+
 #
 # Key derivation function
 #

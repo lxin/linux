@@ -1,8 +1,8 @@
 QUIC in Linux Kernel
 ====================
 
-This branch implements QUIC(RFC9000 and RFC9001) in kernel, currently it's
-implemented:
+This branch implements TLS Handshake Protocol(RFC8446#section-4) and
+QUIC(RFC9000 and RFC9001) in kernel, currently it's implemented:
 
   1. Basic handshakes with Certificate and PSK supported.
   2. Data reliable sending and receiving.
@@ -24,6 +24,8 @@ Certificates can be set on both client and server sides.
 
 It is mostly to add files:
 
+  - crypto/tls_hs.c
+  - include/crypto/tls_hs.h
   - net/quic/*
   - include/net/quic/quic.h
   - include/uapi/linux/quic.h
@@ -33,9 +35,8 @@ This patchset requires the feature described in:
 
   https://lwn.net/Articles/853572/
 
-and two follow-ups I added in this patchset;
+and one follow-up I added in this patchset;
 
-  crypto: move x509_parser.h to include
   crypto: rsa-psspad: Provide PSS signature verify operation
 
 How to Use It

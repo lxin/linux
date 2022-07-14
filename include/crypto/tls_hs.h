@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* TLS Handshake kernel implementation
+/* TLS 1.3 Handshake kernel implementation
  * (C) Copyright Red Hat Corp. 2021
  *
- * This file is the TLS Handshake kernel implementation
+ * This file is the TLS 1.3 Handshake kernel implementation
  *
  * Written or modified by:
  *    Xin Long <lucien.xin@gmail.com>

@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* TLS Handshake kernel implementation
+/* TLS Handshake 1.3 kernel implementation
  * (C) Copyright Red Hat Corp. 2021
  *
- * This file is the TLS Handshake kernel implementation
+ * This file is the TLS 1.3 Handshake kernel implementation
  *
- * Provides APIs for TLS Handshake.
+ * Provides APIs for TLS 1.3 Handshake.
  *
  * Written or modified by:
  *    Xin Long <lucien.xin@gmail.com>
  */
 
-#include <net/quic/tls_hs.h>
+#include <linux/module.h>
 #include <linux/scatterlist.h>
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
@@ -19,7 +19,8 @@
 #include <crypto/akcipher.h>
 #include <crypto/kpp.h>
 #include <crypto/ecdh.h>
-#include <crypto/x509_parser.h>
+#include <crypto/tls_hs.h>
+#include "asymmetric_keys/x509_parser.h"
 
 struct tls_crt {
 	struct tls_crt *next;
@@ -2503,3 +2504,58 @@ void tls_handshake_destroy(struct tls_hs *tls)
 	kfree(tls);
 }
 EXPORT_SYMBOL_GPL(tls_handshake_destroy);
+
+static int __init tls_hs_init(void)
+{
+	void *tfm;
+
+	/* FIXME: load modules in thread context in a nice way */
+	tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_shash(tfm);
+
+	tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_shash(tfm);
+
+	tfm = crypto_alloc_skcipher("ecb(aes)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_skcipher(tfm);
+
+	tfm = crypto_alloc_kpp("ecdh-nist-p256", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_kpp(tfm);
+
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_aead(tfm);
+
+	tfm = crypto_alloc_akcipher("pkcs1pad(rsa,sha256)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_akcipher(tfm);
+
+	tfm = crypto_alloc_akcipher("psspad(rsa,sha256)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	crypto_free_akcipher(tfm);
+
+	printk("tls_hs init\n");
+	return 0;
+}
+
+static void __exit tls_hs_exit(void)
+{
+	printk("tls_hs exit\n");
+}
+
+module_init(tls_hs_init);
+module_exit(tls_hs_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Xin Long <lucien.xin@gmail.com>");
+MODULE_DESCRIPTION("TLS 1.3 handshake APIs");

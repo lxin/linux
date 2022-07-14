@@ -17,16 +17,10 @@
 #include <linux/workqueue.h>
 #include <linux/swap.h>
 #include <linux/quic.h>
-#include <net/quic/tls_hs.h>
 #include <linux/scatterlist.h>
-#include <crypto/hash.h>
-#include <crypto/sha2.h>
 #include <crypto/aead.h>
 #include <crypto/skcipher.h>
-#include <crypto/akcipher.h>
-#include <crypto/kpp.h>
-#include <crypto/ecdh.h>
-#include <crypto/x509_parser.h>
+#include <crypto/tls_hs.h>
 
 struct quic_hash_head {
 	spinlock_t		lock;
