@@ -90,7 +90,7 @@ static int quic_frame_ch_crypto_create(struct quic_sock *qs)
                 return err;
 	f->len = 0;
 
-        err = tls_handshake(qs->tls, NULL, &vec);
+        err = tls_handshake(qs->tls, tls_vec(&vec, NULL, 0));
         if (err < 0)
                 return err;
 
@@ -667,7 +667,7 @@ static int quic_frame_crypto_process(struct quic_sock *qs, u8 **ptr, u8 type, u3
 
 	if (qs->state == QUIC_CS_CLIENT_POST_HANDSHAKE ||
 	    qs->state == QUIC_CS_SERVER_POST_HANDSHAKE) {
-		ret = tls_handshake_post(qs->tls, TLS_P_NONE, tls_vec(&in, p, hs_len), &vec);
+		ret = tls_handshake_post(qs->tls, TLS_P_NONE, tls_vec(&in, p, hs_len));
 		switch (ret) {
 		case TLS_P_NONE:
 			break;
@@ -682,7 +682,7 @@ static int quic_frame_crypto_process(struct quic_sock *qs, u8 **ptr, u8 type, u3
 	}
 
 	/* process */
-	ret = tls_handshake(qs->tls, tls_vec(&in, p, hs_len), &vec);
+	ret = tls_handshake(qs->tls, tls_vec(&in, p, hs_len));
 	switch (ret) {
 	case TLS_ST_START:
 		break;
@@ -695,7 +695,7 @@ static int quic_frame_crypto_process(struct quic_sock *qs, u8 **ptr, u8 type, u3
 
 			qs->state = QUIC_CS_SERVER_WAIT_HANDSHAKE;
 			quic_crypto_handshake_keys_install(qs);
-			err = tls_handshake(qs->tls, NULL, &vec);
+			err = tls_handshake(qs->tls, tls_vec(&vec, NULL, 0));
 			if (err < 0)
 				return err;
 			err = quic_frame_create(qs, QUIC_FRAME_CRYPTO);

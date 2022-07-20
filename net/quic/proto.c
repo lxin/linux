@@ -1087,14 +1087,14 @@ static int quic_setsockopt_events(struct sock *sk, u32 *events, unsigned int len
 static int quic_setsockopt_new_ticket(struct sock *sk, u8 *pskid, unsigned int len)
 {
 	struct quic_sock *qs = quic_sk(sk);
-	struct tls_vec id, vec;
 	struct sk_buff *skb;
+	struct tls_vec vec;
 	int err;
 
 	if (qs->state != QUIC_CS_SERVER_POST_HANDSHAKE)
 		return -EINVAL;
 
-	err = tls_handshake_post(qs->tls, TLS_P_TICKET, tls_vec(&id, pskid, len), &vec);
+	err = tls_handshake_post(qs->tls, TLS_P_TICKET, tls_vec(&vec, pskid, len));
 	if (err)
 		return err;
 	qs->packet.ticket = quic_packet_create(qs, QUIC_PKT_SHORT, QUIC_FRAME_CRYPTO);

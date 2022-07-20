@@ -21,6 +21,11 @@
 #include <crypto/ecdh.h>
 #include <crypto/tls_hs.h>
 #include "asymmetric_keys/x509_parser.h"
+#include <keys/user-type.h>
+#include <linux/key-type.h>
+#include <linux/net.h>
+#include <linux/tls.h>
+#include <linux/tcp.h>
 
 struct tls_crt {
 	struct tls_crt *next;
@@ -38,21 +43,6 @@ struct tls_psk {
 };
 
 enum {
-	TLS_SE_DHE,
-	TLS_SE_EA,
-	TLS_SE_HS,
-	TLS_SE_MS,
-	TLS_SE_RMS,
-	TLS_SE_TEA,
-	TLS_SE_REA,
-	TLS_SE_THS,
-	TLS_SE_RHS,
-	TLS_SE_TAP,
-	TLS_SE_RAP,
-	TLS_SE_MAX,
-};
-
-enum {
 	TLS_B_CH,
 	TLS_B_SH,
 	TLS_B_EE,
@@ -60,6 +50,7 @@ enum {
 	TLS_B_S_CRT,
 	TLS_B_S_CRT_VFY,
 	TLS_B_S_FIN,
+	TLS_B_END_EARLY,
 	TLS_B_C_CRT,
 	TLS_B_C_CRT_VFY,
 	TLS_B_C_FIN,
@@ -81,6 +72,7 @@ struct tls_hs {
 	struct tls_vec omsg;
 
 	struct crypto_kpp *kpp_tfm;
+	struct crypto_aead *aead_tfm;
 	struct crypto_shash *srt_tfm;
 	struct crypto_shash *hash_tfm;
 	struct crypto_akcipher *akc_tfm;
@@ -96,6 +88,7 @@ struct tls_hs {
 	struct tls_psk *psks;
 
 	u8 state:2,
+	   early:1,
 	   is_serv:1,
 	   crt_req:1;
 };
@@ -650,12 +643,12 @@ static int tls_bin_generate(struct tls_hs *tls, struct tls_psk *p,
 {
 	u8 psk[32], bk[32], fbk[32], zeros[32] = {0}, h[32];
 	struct tls_vec psk_v, bk_v, fbk_v, z0_v, h_v;
-	struct tls_vec bk_l = {"res binder", 10};
+	struct tls_vec fbk_l = {"finished", 8}, bk_l;
 	struct crypto_shash *tfm = tls->srt_tfm;
-	struct tls_vec fbk_l = {"finished", 8};
 	int err;
 
 	psk_v = p->key;
+	tls_vec(&bk_l, "ext binder", 10);
 	if (p->lifetime) { /* this is a ticket */
 		struct tls_vec psk_l = {"resumption", 10};
 
@@ -663,6 +656,7 @@ static int tls_bin_generate(struct tls_hs *tls, struct tls_psk *p,
 					     &p->nonce, tls_vec(&psk_v, psk, 32));
 		if (err)
 			return err;
+		tls_vec(&bk_l, "res binder", 10);
 	}
 
 	err = tls_crypto_hkdf_extract(tfm, tls_vec(&z0_v, zeros, 0), &psk_v,
@@ -685,40 +679,77 @@ static int tls_bin_generate(struct tls_hs *tls, struct tls_psk *p,
 	return tls_crypto_hkdf_extract(tfm, &fbk_v, &h_v, bin);
 }
 
-static int tls_keys_ea_setup(struct tls_hs *tls)
+static int tls_keys_derive(struct tls_hs *tls, struct tls_vec *s, struct tls_vec *k, struct tls_vec *i)
 {
-	struct crypto_shash *tfm = tls->srt_tfm;
-	struct tls_vec h_v, l_v = {"derived", 7};
-	u8 h[32], *rl, *tl;
+	struct tls_vec k_l = {"key", 3}, i_l = {"iv", 2};
 	int err;
 
-	err = tls_crypto_hash(tls->hash_tfm, tls->buf, TLS_B_CH + 1, tls_vec(&h_v, h, 32));
+	err = tls_vec_alloc(k, 16);
+        if (err)
+                return err;
+	err = tls_hkdf_expand(tls, s, &k_l, k);
+	if (err)
+		return err;
+	err = tls_vec_alloc(i, 12);
+        if (err)
+                return err;
+	return tls_hkdf_expand(tls, s, &i_l, i);
+}
+
+static int tls_keys_setup(struct tls_hs *tls, u8 t, struct tls_vec *tl,
+			  struct tls_vec *rl, struct tls_vec *h, char *str)
+{
+	struct crypto_shash *tfm = tls->srt_tfm;
+	int err;
+
+	err = tls_crypto_hkdf_expand(tfm, &tls->srt[t], tl, h, &tls->srt[t + 1]);
+	if (err)
+		return err;
+	err = tls_crypto_hkdf_expand(tfm, &tls->srt[t], rl, h, &tls->srt[t + 4]);
+	if (err)
+		return err;
+	pr_debug("[TLS_HS] %s secrets: %32phN, %32phN\n",
+		 str, tls->srt[t + 1].data, tls->srt[t + 4].data);
+
+	if (tls->ext.len)
+		return 0;
+
+	err = tls_keys_derive(tls, &tls->srt[t + 1], &tls->srt[t + 2], &tls->srt[t + 3]);
+	if (err)
+		return err;
+	err = tls_keys_derive(tls, &tls->srt[t + 4], &tls->srt[t + 5], &tls->srt[t + 6]);
 	if (err)
 		return err;
 
-	if (tls->is_serv) {
-		rl = "c e traffic";
-		tl = "s e traffic";
-	} else {
-		tl = "c e traffic";
-		rl = "s e traffic";
-	}
-
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_EA], tls_vec(&l_v, tl, 11),
-				     &h_v, &tls->srt[TLS_SE_TEA]);
-	if (err)
-		return err;
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_EA], tls_vec(&l_v, rl, 11),
-				     &h_v, &tls->srt[TLS_SE_REA]);
-	if (err)
-		return err;
-
-	pr_debug("[TLS_HS] ea keys: %32phN, %32phN\n", tls->srt[TLS_SE_TEA].data,
-		 tls->srt[TLS_SE_REA].data);
+	pr_debug("[TLS_HS] %s keys: %16phN, %16phN\n",
+		 str, tls->srt[t + 2].data, tls->srt[t + 5].data);
+	pr_debug("[TLS_HS] %s ivs: %12phN, %12phN\n",
+		 str, tls->srt[t + 3].data, tls->srt[t + 6].data);
 	return 0;
 }
 
-static int tls_hello_init(struct tls_hs *tls, struct tls_vec *x, struct tls_vec *y)
+static int tls_keys_ea_setup(struct tls_hs *tls)
+{
+	struct tls_vec h_v, rl, tl;
+	u8 h[32];
+	int err;
+
+	if (tls->is_serv) {
+		tls_vec(&rl, "c e traffic", 11);
+		tls_vec(&tl, "s e traffic", 11);
+	} else {
+		tls_vec(&rl, "s e traffic", 11);
+		tls_vec(&tl, "c e traffic", 11);
+	}
+
+	err = tls_crypto_hash(tls->hash_tfm, tls->buf, TLS_B_CH + 1, tls_vec(&h_v, h, 32)); /* h1 */
+	if (err)
+		return err;
+
+	return tls_keys_setup(tls, TLS_SE_EA, &tl, &rl, &h_v, "ea");
+}
+
+static int tls_hello_init(struct tls_hs *tls, struct tls_vec *x, struct tls_vec *y, struct tls_vec *s)
 {
 	u8 compress = 0, random[32] = {0x1}, zeros[32] = {0};
 	u16 cipher = htons(TLS_AES_128_GCM_SHA256);
@@ -743,6 +774,8 @@ static int tls_hello_init(struct tls_hs *tls, struct tls_vec *x, struct tls_vec 
 	if (tls_vec_set(&tls->h.cipher, (u8 *)&cipher, 2))
 		return -ENOMEM;
 
+	if (tls_vec_cpy(&tls->h.session, s))
+		return -ENOMEM;
 	if (!tls->is_serv && tls_vec_set(&tls->h.compress, (u8 *)&compress, 1))
 		return -ENOMEM;
 
@@ -752,11 +785,11 @@ static int tls_hello_init(struct tls_hs *tls, struct tls_vec *x, struct tls_vec 
 static int tls_msg_ch_build(struct tls_hs *tls)
 {
 	u8 *p, *len_p, *extlen_p, *psklen_p, *bin_p, bin[32], x[32], y[32];
-	struct tls_vec vec, bin_v, x_v, y_v;
+	struct tls_vec vec, bin_v, x_v, y_v, s = {NULL, 0};
 	struct tls_psk *psk;
 	int err, len;
 
-	err = tls_hello_init(tls, tls_vec(&x_v, x, 32), tls_vec(&y_v, y, 32));
+	err = tls_hello_init(tls, tls_vec(&x_v, x, 32), tls_vec(&y_v, y, 32), &s);
 	if (err)
 		return err;
 
@@ -814,8 +847,10 @@ static int tls_msg_ch_build(struct tls_hs *tls)
 		return 0;
 	}
 
-	p = tls_put_num(p, TLS_EXT_early_data, 2);
-	p = tls_put_num(p, 0, 2);
+	if (tls->early) {
+		p = tls_put_num(p, TLS_EXT_early_data, 2);
+		p = tls_put_num(p, 0, 2);
+	}
 
 	p = tls_put_num(p, TLS_EXT_psk_kex_modes, 2);
 	p = tls_put_num(p, 2, 2);
@@ -888,14 +923,6 @@ static int tls_msg_sh_build(struct tls_hs *tls, struct tls_vec *x, struct tls_ve
 	p = tls_put_data(p, y);
 
 	if (tls->psks) {
-		p = tls_put_num(p, TLS_EXT_early_data, 2);
-		p = tls_put_num(p, 0, 2);
-
-		p = tls_put_num(p, TLS_EXT_psk_kex_modes, 2);
-		p = tls_put_num(p, 2, 2);
-		p = tls_put_num(p, 1, 1);
-		p = tls_put_num(p, 1, 1); /* psk_dhe_ke */
-
 		p = tls_put_num(p, TLS_EXT_psk, 2);
 		p = tls_put_num(p, 2, 2);
 		p = tls_put_num(p, 0, 2);
@@ -967,48 +994,36 @@ static int tls_crtvfy_sign(struct tls_hs *tls, struct tls_vec *sig)
 
 static int tls_keys_ap_setup(struct tls_hs *tls)
 {
-	struct tls_vec dhs_v, z0_v, h_v, l_v = {"derived", 7};
-	u8 zeros[32] = {0}, dhs[32], h[32], *rl, *tl;
+	struct tls_vec dhs_v, z0_v, h_v, l = {"derived", 7}, rl, tl;
 	struct crypto_shash *tfm = tls->srt_tfm;
+	u8 zeros[32] = {0}, dhs[32], h[32];
 	int err;
 
 	err = tls_crypto_hash(tls->hash_tfm, NULL, 0, tls_vec(&h_v, h, 32)); /* h0 */
 	if (err)
 		return err;
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_HS], &l_v,
+	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_HS], &l,
 				     &h_v, tls_vec(&dhs_v, dhs, 32));
 	if (err)
 		return err;
-
 	err = tls_crypto_hkdf_extract(tfm, &dhs_v, tls_vec(&z0_v, zeros, 32),
 				      &tls->srt[TLS_SE_MS]);
 	if (err)
 		return err;
 
 	if (tls->is_serv) {
-		rl = "c ap traffic";
-		tl = "s ap traffic";
+		tls_vec(&rl, "c ap traffic", 12);
+		tls_vec(&tl, "s ap traffic", 12);
 	} else {
-		tl = "c ap traffic";
-		rl = "s ap traffic";
+		tls_vec(&rl, "s ap traffic", 12);
+		tls_vec(&tl, "c ap traffic", 12);
 	}
 
-	err = tls_crypto_hash(tls->hash_tfm, tls->buf, TLS_B_S_FIN + 1, tls_vec(&h_v, h, 32)); /* h3 */
+	err = tls_crypto_hash(tls->hash_tfm, tls->buf, TLS_B_S_FIN + 1, &h_v); /* h3 */
 	if (err)
 		return err;
 
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_MS], tls_vec(&l_v, tl, 12),
-				     &h_v, &tls->srt[TLS_SE_TAP]);
-	if (err)
-		return err;
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_MS], tls_vec(&l_v, rl, 12),
-				     &h_v, &tls->srt[TLS_SE_RAP]);
-	if (err)
-		return err;
-
-	pr_debug("[TLS_HS] ap keys: %32phN, %32phN\n", tls->srt[TLS_SE_TAP].data,
-		 tls->srt[TLS_SE_RAP].data);
-	return 0;
+	return tls_keys_setup(tls, TLS_SE_MS, &tl, &rl, &h_v, "ap");
 }
 
 static int tls_sf_generate(struct tls_hs *tls, struct tls_vec *sf)
@@ -1050,6 +1065,10 @@ static int tls_msg_hs_build(struct tls_hs *tls)
 	p = tls_put_num(p, 4, 2);
 	p = tls_put_num(p, 2, 2);
 	p = tls_put_num(p, TLS_ECDHE_secp256r1, 2);
+	if (tls->early) {
+		p = tls_put_num(p, TLS_EXT_early_data, 2);
+		p = tls_put_num(p, 0, 2);
+	}
 	if (tls->ext.len)
 		p = tls_put_data(p, &tls->ext);
 	tls_put_num(len_p, (u32)(p - len_p) - 3, 3);
@@ -1141,9 +1160,11 @@ static int tls_ext_supported_groups_handle(struct tls_hs *tls, u8 *p, u32 len)
 {
 	int i;
 
-	for (i = 0; i < len; i += 2, p += 2)
-		if (*((u16 *)p) == htons(TLS_ECDHE_secp256r1))
+	for (i = 0; i < len; i += 2) {
+		pr_debug("[TLS_HS] ext supported groups %d: %x\n", i, *((u16 *)(p + i)));
+		if (*((u16 *)(p + i)) == htons(TLS_ECDHE_secp256r1))
 			return 0;
+	}
 
 	return -ENOENT;
 }
@@ -1152,11 +1173,26 @@ static int tls_ext_key_share_handle(struct tls_hs *tls, u8 *p, u32 len)
 {
 	struct tls_vec x_v, y_v;
 	u8 *x, *y;
-	u32 n;
+	u32 n, l;
 
-	if (tls->is_serv)
-		len = tls_get_num(&p, 2);
-	n = tls_get_num(&p, 2);
+	if (tls->is_serv){
+		l = tls_get_num(&p, 2);
+		while (l > 0) {
+			n = tls_get_num(&p, 2);
+			pr_debug("[TLS_HS] ext group %d %d: %x\n", l, len, n);
+			if (n == TLS_ECDHE_secp256r1)
+				break;
+			len = tls_get_num(&p, 2);
+			p += len;
+			l -= (2 + 2 + len);
+		}
+		if (l <= 0)
+			return -ENOENT;
+	} else {
+		n = tls_get_num(&p, 2);
+		if (n != TLS_ECDHE_secp256r1)
+			return -ENOENT;
+	}
 	len = tls_get_num(&p, 2);
 	p++; /* legacy_form = 4 */
 	x = p;
@@ -1174,9 +1210,11 @@ static int tls_ext_supported_versions_handle(struct tls_hs *tls, u8 *p, u32 len)
 	if (tls->is_serv)
 		n = tls_get_num(&p, 1);
 
-	for (i = 0; i < n; i += 2, p += 2)
-		if (*((u16 *)p) == htons(TLS_MSG_version))
+	for (i = 0; i < n; i += 2) {
+		pr_debug("[TLS_HS] ext supported versions %d: %x\n", i, *((u16 *)(p + i)));
+		if (*((u16 *)(p + i)) == htons(TLS_MSG_version))
 			return 0;
+	}
 
 	return -ENOENT;
 }
@@ -1227,6 +1265,7 @@ static int tls_ext_early_data_handle(struct tls_hs *tls, u8 *p, u32 len)
 	u32 v;
 
 	v = tls_get_num(&p, 4);
+	tls->early = 1;
 	pr_debug("[TLS_HS] ext max_early_data_size %u\n", v);
 
 	return 0;
@@ -1278,10 +1317,13 @@ static int tls_ext_signature_algorithms_handle(struct tls_hs *tls, u8 *p, u32 le
 
 	len = tls_get_num(&p, 2);
 
-	for (i = 0; i < len; i += 2)
+	for (i = 0; i < len; i += 2) {
 		pr_debug("[TLS_HS] ext signature_algorithms %d: %x", i, *((u16 *)(p + i)));
+		if (*((u16 *)(p + i)) == htons(TLS_SAE_rsa_pss_rsae_sha256))
+			return 0;
+	}
 
-	return 0;
+	return -ENOENT;
 }
 
 static int tls_ext_psk_kex_modes_handle(struct tls_hs *tls, u8 *p, u32 len)
@@ -1378,16 +1420,16 @@ static int tls_ext_handle(struct tls_hs *tls, u8 *ext_p, u32 ext_len)
 
 static int tls_keys_hs_setup(struct tls_hs *tls)
 {
-	struct tls_vec des_v, h_v, l_v = {"derived", 7};
+	struct tls_vec des_v, h_v, l = {"derived", 7}, tl, rl;
 	struct crypto_shash *tfm = tls->srt_tfm;
-	u8 des[32], h[32], *rl, *tl;
+	u8 des[32], h[32];
 	int err;
 
 	err = tls_crypto_hash(tls->hash_tfm, NULL, 0, tls_vec(&h_v, h, 32)); /* h0 */
 	if (err)
 		return err;
 
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_EA], &l_v,
+	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_EA], &l,
 				     &h_v, tls_vec(&des_v, des, 32));
 	if (err)
 		return err;
@@ -1398,34 +1440,23 @@ static int tls_keys_hs_setup(struct tls_hs *tls)
 		return err;
 
 	if (tls->is_serv) {
-		rl = "c hs traffic";
-		tl = "s hs traffic";
+		tls_vec(&rl, "c hs traffic", 12);
+		tls_vec(&tl, "s hs traffic", 12);
 	} else {
-		tl = "c hs traffic";
-		rl = "s hs traffic";
+		tls_vec(&rl, "s hs traffic", 12);
+		tls_vec(&tl, "c hs traffic", 12);
 	}
 
-	err = tls_crypto_hash(tls->hash_tfm, tls->buf, TLS_B_SH + 1, tls_vec(&h_v, h, 32)); /* h2 */
+	err = tls_crypto_hash(tls->hash_tfm, tls->buf, TLS_B_SH + 1, &h_v); /* h2 */
 	if (err)
 		return err;
 
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_HS], tls_vec(&l_v, tl, 12),
-				     &h_v, &tls->srt[TLS_SE_THS]);
-	if (err)
-		return err;
-	err = tls_crypto_hkdf_expand(tfm, &tls->srt[TLS_SE_HS], tls_vec(&l_v, rl, 12),
-				     &h_v, &tls->srt[TLS_SE_RHS]);
-	if (err)
-		return err;
-
-	pr_debug("[TLS_HS] hs keys: %32phN, %32phN\n", tls->srt[TLS_SE_THS].data,
-		 tls->srt[TLS_SE_RHS].data);
-	return 0;
+	return tls_keys_setup(tls, TLS_SE_HS, &tl, &rl, &h_v, "hs");
 }
 
 static int tls_msg_ch_handle(struct tls_hs *tls, u8 *p, u32 len)
 {
-	struct tls_vec x_v, y_v;
+	struct tls_vec x_v, y_v, s;
 	u8 x[32], y[32];
 	u32 n, i;
 	int err;
@@ -1436,15 +1467,21 @@ static int tls_msg_ch_handle(struct tls_hs *tls, u8 *p, u32 len)
 	n = tls_get_num(&p, 2);
 	p += 32;
 	len = tls_get_num(&p, 1);
+	tls_vec(&s, p, len);
 	p += len;
 	len = tls_get_num(&p, 2);
-	for (i = 0; i < len; i += 2)
+	for (i = 0; i < len; i += 2) {
 		pr_debug("[TLS_HS] msg ch cipher %d: %x\n", i, *((u16 *)(p + i)));
+		if (*((u16 *)(p + i)) == htons(TLS_AES_128_GCM_SHA256))
+			break;
+	}
+	if (i >= len)
+		return -ENOENT;
 	p += len;
 	len = tls_get_num(&p, 1);
 	p += len;
 
-	err = tls_hello_init(tls, tls_vec(&x_v, x, 32), tls_vec(&y_v, y, 32));
+	err = tls_hello_init(tls, tls_vec(&x_v, x, 32), tls_vec(&y_v, y, 32), &s);
 	if (err)
 		return err;
 
@@ -1480,6 +1517,8 @@ static int tls_msg_sh_handle(struct tls_hs *tls, u8 *p, u32 len)
 	len = tls_get_num(&p, 1);
 	p += len;
 	n = tls_get_num(&p, 2);
+	if (n != TLS_AES_128_GCM_SHA256)
+		return -ENOENT;
 	len = tls_get_num(&p, 1);
 	p += len;
 
@@ -2060,7 +2099,7 @@ static int tls_msg_handle(struct tls_hs *tls, struct tls_vec *imsg)
 			break;
 		}
 
-		if (ret) {
+		if (ret < 0) {
 			pr_err("[TLS_HS] msg handle err %d\n", ret);
 			break;
 		}
@@ -2075,14 +2114,14 @@ static int tls_msg_handle(struct tls_hs *tls, struct tls_vec *imsg)
 	return ret ?: tls->state;
 }
 
-int tls_handshake(struct tls_hs *tls, struct tls_vec *imsg, struct tls_vec *omsg)
+int tls_handshake(struct tls_hs *tls, struct tls_vec *msg)
 {
 	int ret = -EINVAL;
 
 	tls->omsg.len = 0;
 
-	if (imsg) {
-		ret = tls_msg_handle(tls, imsg);
+	if (msg->len) {
+		ret = tls_msg_handle(tls, msg);
 		goto out;
 	}
 
@@ -2098,7 +2137,7 @@ int tls_handshake(struct tls_hs *tls, struct tls_vec *imsg, struct tls_vec *omsg
 	ret = tls_msg_ch_build(tls);
 
 out:
-	*omsg = tls->omsg;
+	*msg = tls->omsg;
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tls_handshake);
@@ -2137,18 +2176,18 @@ static int tls_ticket_build(struct tls_hs *tls, struct tls_vec *id)
 	return 0;
 }
 
-int tls_handshake_post(struct tls_hs *tls, u8 type, struct tls_vec *imsg, struct tls_vec *omsg)
+int tls_handshake_post(struct tls_hs *tls, u8 type, struct tls_vec *msg)
 {
 	int ret = -EINVAL;
 
 	tls->omsg.len = 0;
 	if (type == TLS_P_NONE)
-		ret = tls_msg_handle(tls, imsg);
+		ret = tls_msg_handle(tls, msg);
 	else if (type == TLS_P_TICKET)
-		ret = tls_ticket_build(tls, imsg);
+		ret = tls_ticket_build(tls, msg);
 	else if (type == TLS_P_KEY_UPDATE)
-		ret = tls_ku_build(tls, imsg, 1);
-	*omsg = tls->omsg;
+		ret = tls_ku_build(tls, msg, 1);
+	*msg = tls->omsg;
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tls_handshake_post);
@@ -2276,6 +2315,16 @@ static int tls_set_ca(struct tls_hs *tls, struct tls_vec *vec)
 	return 0;
 }
 
+static int tls_set_early(struct tls_hs *tls, struct tls_vec *vec)
+{
+	u8 e[4] = {TLS_MT_END_OF_EARLY_DATA, 0, 0, 0};
+
+	if (tls_vec_set(&tls->buf[TLS_B_END_EARLY], e, 4))
+		return -ENOMEM;
+	tls->early = !!vec->len;
+	return 0;
+}
+
 int tls_handshake_set(struct tls_hs *tls, u8 type, struct tls_vec *vec)
 {
 	int ret = 0;
@@ -2301,6 +2350,9 @@ int tls_handshake_set(struct tls_hs *tls, u8 type, struct tls_vec *vec)
 		break;
 	case TLS_T_EXT:
 		ret = tls_vec_cpy(&tls->ext, vec);
+		break;
+	case TLS_T_EARLY:
+		ret = tls_set_early(tls, vec);
 		break;
 	}
 	return ret;
@@ -2375,26 +2427,11 @@ int tls_handshake_get(struct tls_hs *tls, u8 type, struct tls_vec *vec)
 	case TLS_T_MSG:
 		*vec = tls->omsg;
 		break;
+	case TLS_T_CMSG:
+		*vec = tls->cmsg;
+		break;
 	case TLS_T_EXT:
 		*vec = tls->ext;
-		break;
-	case TLS_T_THS:
-		*vec = tls->srt[TLS_SE_THS];
-		break;
-	case TLS_T_RHS:
-		*vec = tls->srt[TLS_SE_RHS];
-		break;
-	case TLS_T_TAP:
-		*vec = tls->srt[TLS_SE_TAP];
-		break;
-	case TLS_T_RAP:
-		*vec = tls->srt[TLS_SE_RAP];
-		break;
-	case TLS_T_TEA:
-		*vec = tls->srt[TLS_SE_TEA];
-		break;
-	case TLS_T_REA:
-		*vec = tls->srt[TLS_SE_REA];
 		break;
 	case TLS_T_PKEY:
 		*vec = tls->pkey;
@@ -2418,10 +2455,104 @@ int tls_handshake_get(struct tls_hs *tls, u8 type, struct tls_vec *vec)
 	case TLS_T_CRTS:
 		ret = tls_get_crts(tls, vec);
 		break;
+	case TLS_T_EARLY:
+		vec->len = tls->early;
+		break;
 	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(tls_handshake_get);
+
+int tls_secret_get(struct tls_hs *tls, u8 type, struct tls_vec *vec)
+{
+	if (type >= TLS_SE_MAX)
+		return -EINVAL;
+	*vec = tls->srt[type];
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tls_secret_get);
+
+static int tls_do_encrypt(struct tls_hs *tls, u8 type, struct tls_vec *msg, u32 seq)
+{
+        struct crypto_aead *tfm = tls->aead_tfm;
+	struct tls_vec *key, *iv;
+	struct aead_request *req;
+	struct scatterlist sg;
+	u8 nonce[12], i;
+	__be64 n;
+	int err;
+
+	if (type != TLS_SE_EA && type != TLS_SE_HS && type != TLS_SE_MS)
+		return -EINVAL;
+
+	type += 1;
+	key = &tls->srt[type + 1];
+	iv = &tls->srt[type + 2];
+	memcpy(nonce, iv->data, iv->len);
+	n = cpu_to_be64(seq);
+	for (i = 0; i < 8; i++)
+		nonce[4 + i] ^= ((u8 *)&n)[i];
+	err = crypto_aead_setauthsize(tfm, 16);
+	if (err)
+		return err;
+	err = crypto_aead_setkey(tfm, key->data, key->len);
+	if (err)
+		return err;
+	req = aead_request_alloc(tfm, GFP_ATOMIC);
+	if (!req)
+		return -ENOMEM;
+	sg_init_one(&sg, msg->data, msg->len + 16);
+
+	aead_request_set_ad(req, 5);
+	aead_request_set_crypt(req, &sg, &sg, msg->len - 5, nonce);
+	err = crypto_aead_encrypt(req);
+	if (!err)
+		msg->len += 16;
+
+	kfree(req);
+	return err;
+}
+
+static int tls_do_decrypt(struct tls_hs *tls, u8 type, struct tls_vec *msg, u64 seq)
+{
+	struct crypto_aead *tfm = tls->aead_tfm;
+	struct tls_vec *key, *iv;
+	struct aead_request *req;
+	struct scatterlist sg;
+	u8 nonce[12], i;
+	__be64 n;
+	int err;
+
+	if (type != TLS_SE_EA && type != TLS_SE_HS && type != TLS_SE_MS)
+		return -EINVAL;
+
+	type += 4;
+	key = &tls->srt[type + 1];
+	iv = &tls->srt[type + 2];
+	memcpy(nonce, iv->data, iv->len);
+	n = cpu_to_be64(seq);
+	for (i = 0; i < 8; i++)
+		nonce[4 + i] ^= ((u8 *)&n)[i];
+	err = crypto_aead_setauthsize(tfm, 16);
+	if (err)
+		return err;
+	err = crypto_aead_setkey(tfm, key->data, key->len);
+	if (err)
+		return err;
+	req = aead_request_alloc(tfm, GFP_ATOMIC);
+	if (!req)
+		return -ENOMEM;
+	sg_init_one(&sg, msg->data, msg->len);
+
+	aead_request_set_ad(req, 5);
+	aead_request_set_crypt(req, &sg, &sg, msg->len - 5, nonce);
+	err = crypto_aead_decrypt(req);
+	if (!err)
+		msg->len -= 16;
+
+	kfree(req);
+	return err;
+}
 
 int tls_handshake_create(struct tls_hs **tlsp, bool is_serv, gfp_t gfp)
 {
@@ -2450,6 +2581,11 @@ int tls_handshake_create(struct tls_hs **tlsp, bool is_serv, gfp_t gfp)
                 goto err;
         }
 
+	tls->aead_tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tls->aead_tfm)) {
+		err = PTR_ERR(tls->aead_tfm);
+		goto err;
+	}
         tls->akc_tfm = crypto_alloc_akcipher("psspad(rsa,sha256)", 0, 0);
         if (IS_ERR(tls->akc_tfm)) {
                 err = PTR_ERR(tls->akc_tfm);
@@ -2497,6 +2633,7 @@ void tls_handshake_destroy(struct tls_hs *tls)
 	kfree(tls->pkey.data);
 
 	crypto_free_kpp(tls->kpp_tfm);
+	crypto_free_aead(tls->aead_tfm);
 	crypto_free_shash(tls->hash_tfm);
 	crypto_free_shash(tls->srt_tfm);
 	crypto_free_akcipher(tls->akc_tfm);
@@ -2504,6 +2641,516 @@ void tls_handshake_destroy(struct tls_hs *tls)
 	kfree(tls);
 }
 EXPORT_SYMBOL_GPL(tls_handshake_destroy);
+
+/* These APIs below are for general TCP TLS handshake, also an example for
+ * how to use tls_* APIs. */
+
+#if IS_ENABLED(CONFIG_TLS)
+
+static int tls_gen_ktls_setup(struct socket *sock, struct tls_hs *tls, u64 rseq, u64 wseq)
+{
+	struct tls12_crypto_info_aes_gcm_128 crypto_info;
+	struct tls_vec key, iv;
+	int err;
+
+	err = sock->ops->setsockopt(sock, SOL_TCP, TCP_ULP,
+				    KERNEL_SOCKPTR("tls"), sizeof("tls"));
+	if (err) {
+		pr_err("[TLS_HS_GEN] ktls setup TCP_ULP err %d\n", err);
+		return err;
+	}
+
+	memset(&crypto_info, 0, sizeof(crypto_info));
+	crypto_info.info.version = TLS_1_3_VERSION;
+	crypto_info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+
+	err = tls_secret_get(tls, TLS_SE_TAP_KEY, &key);
+	if (err)
+		return err;
+	err = tls_secret_get(tls, TLS_SE_TAP_IV, &iv);
+	if (err)
+		return err;
+	memcpy(crypto_info.key, key.data, TLS_CIPHER_AES_GCM_128_KEY_SIZE);
+	memcpy(crypto_info.iv, iv.data + 4, TLS_CIPHER_AES_GCM_128_IV_SIZE);
+	memcpy(crypto_info.rec_seq, &wseq, TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+	memcpy(crypto_info.salt, iv.data, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+	err = sock->ops->setsockopt(sock, SOL_TLS, TLS_TX,
+				    KERNEL_SOCKPTR(&crypto_info), sizeof(crypto_info));
+	if (err) {
+		pr_err("[TLS_HS_GEN] ktls setup TCP_TX err %d\n", err);
+		return err;
+	}
+
+	memset(&crypto_info, 0, sizeof(crypto_info));
+	crypto_info.info.version = TLS_1_3_VERSION;
+	crypto_info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+	err = tls_secret_get(tls, TLS_SE_RAP_KEY, &key);
+	if (err)
+		return err;
+	err = tls_secret_get(tls, TLS_SE_RAP_IV, &iv);
+	if (err)
+		return err;
+	memcpy(crypto_info.key, key.data, TLS_CIPHER_AES_GCM_128_KEY_SIZE);
+	memcpy(crypto_info.iv, iv.data + 4, TLS_CIPHER_AES_GCM_128_IV_SIZE);
+	memcpy(crypto_info.rec_seq, &rseq, TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE);
+	memcpy(crypto_info.salt, iv.data, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+	err = sock->ops->setsockopt(sock, SOL_TLS, TLS_RX,
+				    KERNEL_SOCKPTR(&crypto_info), sizeof(crypto_info));
+	if (err) {
+		pr_err("[TLS_HS_GEN] ktls setup TCP_RX err %d\n", err);
+		return err;
+	}
+	return 0;
+}
+
+#else
+
+static int tls_gen_ktls_setup(struct socket *sock, struct tls_hs *tls, be64 rseq, be64 wseq)
+{
+	pr_err("[TLS_HS_GEN] please enable CONFIG_TLS or use flag with TLS_F_NO_KTLS.\n");
+	return -EPROTONOSUPPORT;
+}
+
+#endif /* CONFIG_TLS */
+
+static int tls_gen_msg_build(struct tls_hs *tls, struct tls_vec *v, struct tls_vec *o, u8 crypt, u32 seq)
+{
+	u32 len = v->len;
+	u8 *p, type = 22;
+	int err = 0;
+
+	if (crypt) {
+		type = 23;
+		len += 17;
+	}
+	p = o->data + o->len;
+	p = tls_put_num(p, type, 1);
+	p = tls_put_num(p, 0x0303, 2);
+	p = tls_put_num(p, len, 2);
+	p = tls_put_data(p, v);
+	if (crypt) {
+		type = 22;
+		if (crypt == TLS_SE_MS || (crypt == TLS_SE_EA && !seq))
+			type = 23;
+		p = tls_put_num(p, type, 1);
+		tls_vec(v, o->data + o->len, v->len + 6);
+		err = tls_do_encrypt(tls, crypt, v, seq);
+		if (err) {
+			pr_err("[TLS_HS_GEN] msg send encrypt err %d\n", err);
+			return err;
+		}
+	}
+	o->len += (len + 5);
+	return err;
+}
+
+static int tls_gen_get_num(struct tls_hs *tls, u8 type)
+{
+	struct tls_vec v;
+
+	tls_handshake_get(tls, type, &v);
+	return v.len;
+}
+
+static int tls_gen_set_num(struct tls_hs *tls, u8 type, u32 value)
+{
+	struct tls_vec v;
+
+	return tls_handshake_set(tls, type, tls_vec(&v, NULL, value));
+}
+
+static int tls_gen_msg_handle(struct tls_hs *tls, struct tls_vec *v, struct tls_vec *o,
+			      struct tls_vec *e, u8 is_serv, u64 *rseq, u64 *eseq)
+{
+	u8 emsg[4] = {TLS_MT_END_OF_EARLY_DATA, 0, 0, 0};
+	u32 len, plen, ver, dlen = v->len;
+	struct tls_vec vec, ev;
+	u8 type, *p = v->data;
+	int err, ret;
+
+	while (dlen > 0) {
+		type = tls_get_num(&p, 1);
+		ver = tls_get_num(&p, 2);
+		len = tls_get_num(&p, 2);
+		plen = len;
+		pr_debug("[TLS_HS_GEN] msg recv type %d\n", type);
+		if (type == 23) { /* encrypted data */
+			if (is_serv && tls_gen_get_num(tls, TLS_T_EARLY)) { /* process early data */
+				tls_vec(&vec, p - 5, plen + 5);
+				err = tls_do_decrypt(tls, TLS_SE_EA, &vec, (*eseq)++);
+				if (err) {
+					pr_err("[TLS_HS_GEN] msg recv ea err %d\n", err);
+					return err;
+				}
+				plen -= 17;
+				type = p[plen];
+				if (type == 22) {
+					if (*p != TLS_MT_END_OF_EARLY_DATA)
+						return -EINVAL;
+					err = tls_gen_set_num(tls, TLS_T_EARLY, 0);
+					if (err)
+						return err;
+					pr_debug("[TLS_HS_GEN] msg recv ea end of data\n");
+				} else if (type == 23) {
+					pr_debug("[TLS_HS_GEN] msg recv ea data %d %d\n", e->len, plen);
+					memcpy(e->data + e->len, p, plen);
+					e->len += plen;
+				} else {
+					pr_debug("[TLS_HS_GEN] msg recv ea skip type %d\n", type);
+				}
+				dlen -= (5 + len);
+				p += len;
+				continue;
+			}
+			tls_vec(&vec, p - 5, plen + 5);
+			err = tls_do_decrypt(tls, TLS_SE_HS, &vec, (*rseq)++);
+			if (err) {
+				pr_err("[TLS_HS_GEN] msg recv hs err %d\n", err);
+				return err;
+			}
+			plen -= 17;
+			type = p[plen];
+			pr_debug("[TLS_HS_GEN] msg recv internal type %d\n", type);
+		}
+		if (type != 22) {
+			pr_debug("[TLS_HS_GEN] msg recv skip type %d\n", type);
+			dlen -= (5 + len);
+			p += len;
+			continue;
+		}
+		ret = tls_handshake(tls, tls_vec(&vec, p, plen));
+		switch (ret) {
+		case TLS_ST_START:
+		case TLS_ST_WAIT:
+			break;
+		case TLS_ST_RCVD:
+			if (!is_serv)
+				break;
+			err = tls_gen_msg_build(tls, &vec, o, 0, 0);
+			if (err < 0)
+				return err;
+			err = tls_handshake(tls, tls_vec(&vec, NULL, 0));
+			if (err < 0)
+				return err;
+			err = tls_gen_msg_build(tls, &vec, o, TLS_SE_HS, 0);
+			if (err < 0)
+				return err;
+			break;
+		case TLS_ST_CONNECTED:
+			if (!is_serv) {
+				if (tls_gen_get_num(tls, TLS_T_EARLY)) { /* end early data */
+					err = tls_gen_msg_build(tls, tls_vec(&ev, emsg, 4), o, TLS_SE_EA, 1);
+					if (err < 0)
+						return err;
+					err = tls_gen_set_num(tls, TLS_T_EARLY, 0);
+					if (err)
+						return err;
+				}
+				err = tls_gen_msg_build(tls, &vec, o, TLS_SE_HS, 0);
+				if (err < 0)
+					return err;
+			}
+			v->data = p + len;
+			v->len = dlen - (5 + len);
+			return 1;
+		default:
+			err = ret;
+			return err;
+		}
+		dlen -= (5 + len);
+		p += len;
+	}
+	return 0;
+}
+
+static int tls_gen_post_handle(struct tls_hs *tls, u8 type, struct tls_vec *v)
+{
+	int ret, err = 0;
+
+	if (type != 22) {
+		pr_debug("[TLS_HS_GEN] post handle alert %d %d\n", type, v->len);
+		return 0;
+	}
+	ret = tls_handshake_post(tls, TLS_P_NONE, v);
+	switch (ret) {
+	case TLS_P_KEY_UPDATE:
+		pr_debug("[TLS_HS_GEN] post key_updata %d\n", v->len);
+		break;
+	case TLS_P_TICKET:
+		pr_debug("[TLS_HS_GEN] post ticket %d\n", v->len);
+		break;
+	default:
+		err = ret;
+		pr_err("[TLS_HS_GEN] post process err %d\n", ret);
+	}
+	return err;
+}
+
+static int tls_gen_app_handle(struct tls_hs *tls, struct tls_vec *v, struct tls_vec *o, u64 *rseq)
+{
+	u32 len, plen, ver, dlen = v->len;
+	u8 type, *p = v->data;
+	struct tls_vec vec;
+	int err;
+
+	o->len = 0;
+	while (dlen > 0) {
+		type = tls_get_num(&p, 1);
+		ver = tls_get_num(&p, 2);
+		len = tls_get_num(&p, 2);
+		if (type != 23)
+			return -EINVAL;
+		tls_vec(&vec, p - 5, len + 5);
+		err = tls_do_decrypt(tls, TLS_SE_MS, &vec, (*rseq)++);
+		if (err) {
+			pr_err("[TLS_HS_GEN] app handle decrypt err %d\n", err);
+			return err;
+		}
+		plen = len - 17;
+		type = p[plen];
+		pr_debug("[TLS_HS_GEN] app handle type %d\n", type);
+		if (type == 23) {
+			pr_debug("[TLS_HS_GEN] app recv data %d %d\n", o->len, plen);
+			memcpy(o->data + o->len, p, plen);
+			o->len += plen;
+		} else {
+			err = tls_gen_post_handle(tls, type, &vec);
+			if (err) {
+				pr_err("[TLS_HS_GEN] app post handle err %d\n", err);
+				return err;
+			}
+		}
+		dlen -= (5 + len);
+		p += len;
+	}
+	return 0;
+}
+
+static int tls_gen_key_setup(struct tls_hs *tls, struct key *key, u8 type, char *sub, u8 *data)
+{
+	key_ref_t kref = NULL;
+	struct tls_vec vec;
+	int len;
+
+	kref = keyring_search(make_key_ref(key, 1UL), &key_type_user, sub, false);
+	if (IS_ERR(kref)) {
+		pr_debug("[TLS_HS_GEN] keyring request_key %s %ld\n", sub, PTR_ERR(kref));
+		return PTR_ERR(kref);
+	}
+	len = user_read(key_ref_to_ptr(kref), data, PAGE_SIZE);
+	return tls_handshake_set(tls, type, tls_vec(&vec, data, len));
+}
+
+static int tls_gen_key_append(struct tls_hs *tls, struct key *key, char *sub, struct tls_vec *v, u8 l)
+{
+	u8 *p = v->data + v->len;
+	key_ref_t kref = NULL;
+	int len;
+
+	kref = keyring_search(make_key_ref(key, 1UL), &key_type_user, sub, false);
+	if (IS_ERR(kref)) {
+		pr_debug("[TLS_HS_GEN] keyring request_key %s %ld\n", sub, PTR_ERR(kref));
+		return PTR_ERR(kref);
+	}
+
+	if (!l) {
+		len = user_read(key_ref_to_ptr(kref), p + 4, PAGE_SIZE - v->len - 4);
+		*((u32 *)p) = len;
+		len += 4;
+	} else {
+		len = user_read(key_ref_to_ptr(kref), p, l);
+		if (len != l)
+			return -EINVAL;
+	}
+	v->len += len;
+	return 0;
+}
+
+struct tls_hs *tls_gen_handshake(struct socket *sock, struct tls_vec *v, char *subsys, u8 flag)
+{
+	u8 *data, is_serv = flag & TLS_F_SERV;
+	u64 rseq = 0, wseq = 0, eseq = 0;
+	struct tls_vec vec, out, ea;
+	char sub[32] = {'\0'};
+	struct tls_hs *tls;
+	struct msghdr msg;
+	int err, ret, i;
+	struct key *key;
+	struct kvec iv;
+
+	err = tls_handshake_create(&tls, is_serv, GFP_ATOMIC);
+	if (err)
+		return ERR_PTR(err);
+	data = (u8 *)__get_free_page(GFP_ATOMIC);
+	if (!data) {
+		err = -ENOMEM;
+		goto err;
+	}
+	if (flag & (TLS_F_CRT | TLS_F_PSK)) {
+		sprintf(sub, "%s-%d", subsys, is_serv);
+		key = request_key(&key_type_keyring, sub, NULL);
+		if (IS_ERR(key)) {
+			pr_err("[TLS_HS_GEN] keyring request_key tls err %ld\n", PTR_ERR(key));
+			err = PTR_ERR(key);
+			goto err;
+		}
+	}
+	if (flag & TLS_F_CRT) {
+		err = tls_gen_key_setup(tls, key, TLS_T_PKEY, "pkey", data);
+		if (err && is_serv)
+			goto err;
+		for (i = 0; i < 5; i++) { /* certificate chain */
+			sprintf(sub, "%s-%d", "crt", i);
+			err = tls_gen_key_setup(tls, key, TLS_T_CRT, sub, data);
+			if (err == -EAGAIN)
+				break;
+			if (err)
+				goto err;
+		}
+		if (!i && is_serv) {
+			err = -EINVAL;
+			goto err;
+		}
+		err = tls_gen_key_setup(tls, key, TLS_T_CA, "ca", data);
+		if (err && err != -EAGAIN)
+			goto err;
+		if (flag & TLS_F_CRT_REQ)
+			tls_gen_set_num(tls, TLS_T_CRT_REQ, 1);
+	} else if (flag & TLS_F_PSK) {
+		tls_vec(&vec, data, 0);
+		for (i = 0; i < 5; i++) { /* psks */
+			sprintf(sub, "psk-%d-id", i);
+			err = tls_gen_key_append(tls, key, sub, &vec, 0);
+			if (err < 0)
+				goto err;
+			sprintf(sub, "psk-%d-master", i);
+			err = tls_gen_key_append(tls, key, sub, &vec, 0);
+			if (err < 0)
+				goto err;
+			sprintf(sub, "psk-%d-nonce", i);
+			err = tls_gen_key_append(tls, key, sub, &vec, 0);
+			if (err < 0) {
+				if (err != -EAGAIN)
+					goto err;
+				memset(vec.data + vec.len, 0, 12);
+				vec.len += 12;
+				break;
+			}
+			sprintf(sub, "psk-%d-ageadd", i);
+			err = tls_gen_key_append(tls, key, sub, &vec, 4);
+			if (err < 0)
+				goto err;
+			sprintf(sub, "psk-%d-lifetime", i);
+			err = tls_gen_key_append(tls, key, sub, &vec, 4);
+			if (err < 0)
+				goto err;
+		}
+		err = tls_handshake_set(tls, TLS_T_PSK, &vec);
+		if (err)
+			goto err;
+	}
+	tls_handshake_get(tls, TLS_T_EXT, &out); /* reuse tls->ext */
+	tls_handshake_get(tls, TLS_T_CMSG, &ea); /* reuse tls->cmsg */
+	if (!is_serv) { /* send client hello */
+		if (v->len) {
+			err = tls_gen_set_num(tls, TLS_T_EARLY, 1);
+			if (err)
+				goto err;
+		}
+		err = tls_handshake(tls, tls_vec(&vec, NULL, 0));
+		if (err < 0)
+			goto err;
+		err = tls_gen_msg_build(tls, &vec, &out, 0, 0);
+		if (err)
+			goto err;
+		if (v->len) { /* start early data */
+			err = tls_gen_msg_build(tls, v, &out, TLS_SE_EA, 0);
+			if (err)
+				goto err;
+			v->len = 0;
+		}
+		memset(&msg, 0, sizeof(msg));
+		iv.iov_base = out.data;
+		iv.iov_len = out.len;
+		err = kernel_sendmsg(sock, &msg, &iv, 1, iv.iov_len);
+		if (err < 0) {
+			pr_err("[TLS_HS_GEN] msg send err %d\n", err);
+			goto err;
+		}
+		out.len = 0;
+	}
+	while (1) { /* recv hs msg and wait handshake done */
+		memset(&msg, 0, sizeof(msg));
+		iv.iov_base = data;
+		iv.iov_len = PAGE_SIZE;
+		err = kernel_recvmsg(sock, &msg, &iv, 1, iv.iov_len, 0);
+		if (err < 0)
+			goto err;
+
+		tls_vec(&vec, data, err);
+		err = tls_gen_msg_handle(tls, &vec, &out, &ea, is_serv, &rseq, &eseq); /* handle hs msg */
+		if (err < 0)
+			goto err;
+		if (out.len > 0) {
+			if (v->len) {
+				err = tls_gen_msg_build(tls, v, &out, TLS_SE_MS, wseq++);
+				if (err < 0)
+					goto err;
+				v->len = 0;
+			}
+			memset(&msg, 0, sizeof(msg));
+			iv.iov_base = out.data;
+			iv.iov_len = out.len;
+			ret = kernel_sendmsg(sock, &msg, &iv, 1, iv.iov_len);
+			if (ret < 0) {
+				err = ret;
+				pr_err("[TLS_HS_GEN] msg send err %d\n", err);
+				goto err;
+			}
+			out.len = 0;
+		}
+		if (!err)
+			continue;
+		rseq = 0;
+		if (vec.len) {
+			err = tls_gen_app_handle(tls, &vec, &ea, &rseq); /* handle data msg */
+			if (err < 0)
+				goto err;
+		}
+		if (!(flag & TLS_F_NO_KTLS)) {
+			err = tls_gen_ktls_setup(sock, tls, cpu_to_be64(rseq), cpu_to_be64(wseq));
+			if (err < 0)
+				goto err;
+		}
+		*v = ea;
+		break;
+	}
+	free_page((unsigned long)data);
+	return tls;
+err:
+	free_page((unsigned long)data);
+	tls_handshake_destroy(tls);
+	return ERR_PTR(err);
+}
+EXPORT_SYMBOL_GPL(tls_gen_handshake);
+
+int tls_gen_handshake_post(struct socket *sock, struct tls_hs *tls, u8 type, struct tls_vec *v)
+{
+	return tls_gen_post_handle(tls, type, v);
+}
+EXPORT_SYMBOL_GPL(tls_gen_handshake_post);
+
+int tls_gen_encrypt(struct tls_hs *tls, struct tls_vec *msg, u32 seq)
+{
+	return tls_do_encrypt(tls, TLS_SE_MS, msg, seq);
+}
+EXPORT_SYMBOL_GPL(tls_gen_encrypt);
+
+int tls_gen_decrypt(struct tls_hs *tls, struct tls_vec *msg, u32 seq)
+{
+	return tls_do_decrypt(tls, TLS_SE_MS, msg, seq);
+}
+EXPORT_SYMBOL_GPL(tls_gen_decrypt);
 
 static int __init tls_hs_init(void)
 {
@@ -2545,13 +3192,13 @@ static int __init tls_hs_init(void)
 		return PTR_ERR(tfm);
 	crypto_free_akcipher(tfm);
 
-	printk("tls_hs init\n");
+	pr_info("tls_hs init\n");
 	return 0;
 }
 
 static void __exit tls_hs_exit(void)
 {
-	printk("tls_hs exit\n");
+	pr_info("tls_hs exit\n");
 }
 
 module_init(tls_hs_init);

@@ -419,7 +419,7 @@ int quic_crypto_early_keys_install(struct quic_sock *qs)
 	struct tls_vec srt = {NULL, 0}, k, iv, hp_k;
 	int err;
 
-	err = tls_handshake_get(qs->tls, TLS_T_TEA, &srt);
+	err = tls_secret_get(qs->tls, TLS_SE_TEA, &srt);
 	if (err)
 		return err;
 
@@ -431,7 +431,7 @@ int quic_crypto_early_keys_install(struct quic_sock *qs)
 		return err;
 	pr_debug("[QUIC] ea tx keys: %16phN, %12phN, %16phN\n", k.data, iv.data, hp_k.data);
 
-	err = tls_handshake_get(qs->tls, TLS_T_REA, &srt);
+	err = tls_secret_get(qs->tls, TLS_SE_REA, &srt);
 	if (err)
 		return err;
 
@@ -450,7 +450,7 @@ int quic_crypto_handshake_keys_install(struct quic_sock *qs)
 	struct tls_vec srt = {NULL, 0}, k, iv, hp_k;
 	int err;
 
-	err = tls_handshake_get(qs->tls, TLS_T_THS, &srt);
+	err = tls_secret_get(qs->tls, TLS_SE_THS, &srt);
 	if (err)
 		return err;
 
@@ -462,7 +462,7 @@ int quic_crypto_handshake_keys_install(struct quic_sock *qs)
 		return err;
 	pr_debug("[QUIC] hs tx keys: %16phN, %12phN, %16phN\n", k.data, iv.data, hp_k.data);
 
-	err = tls_handshake_get(qs->tls, TLS_T_RHS, &srt);
+	err = tls_secret_get(qs->tls, TLS_SE_RHS, &srt);
 	if (err)
 		return err;
 
@@ -482,7 +482,7 @@ int quic_crypto_application_keys_install(struct quic_sock *qs)
 	u8 p = qs->crypt.key_phase;
 	int err;
 
-	err = tls_handshake_get(qs->tls, TLS_T_TAP, &srt);
+	err = tls_secret_get(qs->tls, TLS_SE_TAP, &srt);
 	if (err)
 		return err;
 
@@ -494,7 +494,7 @@ int quic_crypto_application_keys_install(struct quic_sock *qs)
 		return err;
 	pr_debug("[QUIC] ap tx keys: %16phN, %12phN, %16phN\n", k.data, iv.data, hp_k.data);
 
-	err = tls_handshake_get(qs->tls, TLS_T_RAP, &srt);
+	err = tls_secret_get(qs->tls, TLS_SE_RAP, &srt);
 	if (err)
 		return err;
 
@@ -510,10 +510,10 @@ int quic_crypto_application_keys_install(struct quic_sock *qs)
 
 int quic_crypto_key_update(struct quic_sock *qs)
 {
-	struct tls_vec l = {"quic ku", 7}, vec;
+	struct tls_vec vec = {"quic ku", 7};
 	int err;
 
-	err = tls_handshake_post(qs->tls, TLS_P_KEY_UPDATE, &l, &vec);
+	err = tls_handshake_post(qs->tls, TLS_P_KEY_UPDATE, &vec);
 	if (err)
 		return err;
 	qs->crypt.key_phase = !!qs->crypt.key_phase;

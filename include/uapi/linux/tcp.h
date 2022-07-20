@@ -128,6 +128,7 @@ enum {
 #define TCP_CM_INQ		TCP_INQ
 
 #define TCP_TX_DELAY		37	/* delay outgoing packets by XX usec */
+#define TCP_TLS_HS		38	/* do tls 1.3 handshake in kernel */
 
 
 #define TCP_REPAIR_ON		1
