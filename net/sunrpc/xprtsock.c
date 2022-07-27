@@ -48,6 +48,7 @@
 #include <net/udp.h>
 #include <net/tcp.h>
 #include <net/tls.h>
+#include <crypto/tls_hs.h>
 
 #include <linux/bvec.h>
 #include <linux/highmem.h>
@@ -2422,7 +2423,7 @@ out_unlock:
 	current_restore_flags(pflags, PF_MEMALLOC);
 }
 
-#if IS_ENABLED(CONFIG_TLS)
+#if IS_ENABLED(CONFIG_CRYPTO_TLS_HS)
 
 /**
  * xs_tls_connect - establish a TLS session on a socket
@@ -2433,7 +2434,10 @@ static void xs_tls_connect(struct work_struct *work)
 {
 	struct sock_xprt *transport =
 		container_of(work, struct sock_xprt, connect_worker.work);
+	struct tls_vec v = {NULL, 0};
 	struct rpc_clnt *clnt;
+	struct tls_hs *tls;
+	u8 flag = 0;
 
 	clnt = transport->xprtsec_clnt;
 	transport->xprtsec_clnt = NULL;
@@ -2442,6 +2446,25 @@ static void xs_tls_connect(struct work_struct *work)
 
 	xs_tcp_setup_socket(work);
 
+	/* TLS_F_SERV: for server side.
+	 * TLS_F_CRT: if you have cert/ca/pkey set via keyring 'nfs-0/1'.
+	 * TLS_F_CRT_REQ: if server wants to request client certs.
+	 */
+	if (transport->xprt.xprtsec == RPC_XPRTSEC_TLS_PSK)
+		flag |= TLS_F_PSK;
+
+	/* pass '&v' in case there is early data to send or recv. */
+	tls = tls_sk_handshake(transport->sock, &v, "nfs", flag);
+	if (IS_ERR(tls)) {
+		pr_err("%s: failed on TLS handshake %ld\n", __func__, PTR_ERR(tls));
+		goto out;
+	}
+
+	/* if you want to use tls_gen_handshake_post(tls) to handle post-handshake
+	 * msgs later, you should save this 'tls' somewhere, instead of destroying it.
+	 */
+	tls_handshake_destroy(tls);
+out:
 	rpc_shutdown_client(clnt);
 
 out_unlock:
@@ -2487,7 +2510,7 @@ static void xs_set_xprtsec_clnt(struct rpc_clnt *clnt, struct rpc_xprt *xprt)
 	transport->xprtsec_clnt = ERR_PTR(-ENOTCONN);
 }
 
-#endif /*CONFIG_TLS */
+#endif /* CONFIG_CRYPTO_TLS_HS */
 
 /**
  * xs_connect - connect a socket to a remote endpoint
@@ -3145,7 +3168,7 @@ static struct rpc_xprt *xs_setup_tcp(struct xprt_create *args)
 		break;
 	case RPC_XPRTSEC_TLS_X509:
 	case RPC_XPRTSEC_TLS_PSK:
-#if IS_ENABLED(CONFIG_TLS)
+#if IS_ENABLED(CONFIG_CRYPTO_TLS_HS)
 		INIT_DELAYED_WORK(&transport->connect_worker, xs_tls_connect);
 #else
 		ret = ERR_PTR(-EACCES);
