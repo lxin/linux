@@ -279,6 +279,7 @@
 #include <linux/uaccess.h>
 #include <asm/ioctls.h>
 #include <net/busy_poll.h>
+#include <crypto/tls_hs.h>
 
 /* Track pending CMSGs. */
 enum {
@@ -4356,6 +4357,44 @@ zerocopy_rcv_inq:
 zerocopy_rcv_out:
 		if (!err && copy_to_user(optval, &zc, len))
 			err = -EFAULT;
+		return err;
+	}
+#endif
+#if IS_BUILTIN(CONFIG_CRYPTO_TLS_HS)
+	case TCP_TLS_HS: {
+		struct tls_vec vec = {NULL, 0};
+		struct tls_hs *tls;
+		u8 *p, flag;
+		int err = 0;
+
+		if (get_user(len, optlen) || len < 1)
+			return -EFAULT;
+		p = memdup_user(optval, len);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+
+		flag = *p; /* get flag for tls setup */
+		if (len >= 5) { /* get early data to send */
+			tls_vec(&vec, p + 5, *((u32 *)(p + 1)));
+			if (len - 5 < vec.len) {
+				err = -EINVAL;
+				goto tls_err;
+			}
+		}
+
+		tls = tls_sk_handshake(sk->sk_socket, &vec, "tcp", flag);
+		if (IS_ERR(tls)) {
+			err = PTR_ERR(tls);
+			goto tls_err;
+		}
+
+		/* copy it back if there is early data received */
+		if (len < vec.len || put_user(vec.len, optlen) ||
+		    (vec.len && copy_to_user(optval, vec.data, vec.len)))
+			err = -EFAULT;
+		tls_handshake_destroy(tls);
+tls_err:
+		kfree(p);
 		return err;
 	}
 #endif
