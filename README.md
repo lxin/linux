@@ -11,7 +11,7 @@
   Kernel TLS 1.3 Handshakes are also required by NFSv4 and QUIC in Kernel:
 
     - QUIC: https://datatracker.ietf.org/doc/html/rfc9001
-    - NFSv4: https://datatracker.ietf.org/doc/draft-ietf-nfsv4-rpc-tls/
+    - NFSv4: https://datatracker.ietf.org/doc/html/rfc9289
 
   This patch series is to add a couple of APIs in crypto to help kernel
   developers complete TLS 1.3 handshake and even process post handshake
